@@ -19,7 +19,6 @@ import (
 
     "github.com/moby/moby/api/pkg/stdcopy"
     "github.com/moby/moby/api/types/container"
-    "github.com/moby/moby/api/types/image"
     "github.com/moby/moby/api/types/mount"
     "github.com/moby/moby/api/types/network"
     "github.com/moby/moby/client"
@@ -386,7 +385,6 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
             SecurityOpt: []string{"no-new-privileges:true"},
         },
         NetworkingConfig: &network.NetworkingConfig{},
-        Platform:         nil,
     })
     if err != nil {
         return fmt.Errorf("container create: %w", err)
@@ -409,7 +407,6 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
         return fmt.Errorf("container start: %w", err)
     }
 
-    // Stream progress from attach stdout (ffmpeg -progress pipe:1)
     doneLogs := make(chan struct{})
     go func() {
         defer close(doneLogs)
@@ -421,15 +418,15 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
         Condition: container.WaitConditionNotRunning,
     })
     select {
-    case err := <-waitRes.Err:
+    case err := <-waitRes.Error:
         <-doneLogs
         if err != nil {
-            return fmt.Errorf("container wait: %w", err)
+            return fmt.Errorf("container wait error: %w", err)
         }
-    case st := <-waitRes.StatusCode:
+    case res := <-waitRes.Result:
         <-doneLogs
-        if st != 0 {
-            return fmt.Errorf("ffmpeg exited with status %d", st)
+        if res.StatusCode != 0 {
+            return fmt.Errorf("ffmpeg exited with status %d", res.StatusCode)
         }
     }
 
@@ -507,13 +504,13 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, hostInput
         Condition: container.WaitConditionNotRunning,
     })
     select {
-    case err := <-waitRes.Err:
+    case err := <-waitRes.Error:
         if err != nil {
             return nil, err
         }
-    case st := <-waitRes.StatusCode:
-        if st != 0 {
-            return nil, fmt.Errorf("ffprobe status %d: %s", st, stderr.String())
+    case res := <-waitRes.Result:
+        if res.StatusCode != 0 {
+            return nil, fmt.Errorf("ffprobe status %d: %s", res.StatusCode, stderr.String())
         }
     }
 
@@ -525,12 +522,12 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, hostInput
 }
 
 func ensureImage(ctx context.Context, cli *client.Client, ref string) error {
-    _, _, err := cli.ImageInspectWithRaw(ctx, ref)
+    _, err := cli.ImageInspect(ctx, ref)
     if err == nil {
         return nil
     }
 
-    rc, err := cli.ImagePull(ctx, ref, image.PullOptions{})
+    rc, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
     if err != nil {
         return err
     }
@@ -592,9 +589,6 @@ func buildOutputName(base string, is1080 bool, hdrSuffix bool) string {
 }
 
 func buildFilter(job Job, make1080 bool) string {
-    // Only colour-convert if Dolby Vision (DV -> HDR10-ish).
-    // If already HDR (non-DV), no colour conversion, only scale if 1080 requested.
-    // SDR inputs are still encoded as 10-bit and signalled HDR via x265 params.
     if job.IsDV {
         if make1080 {
             return "zscale=t=linear:npl=100,format=gbrpf32le,zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,tonemap=mobius:desat=0,zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc:range=limited,format=yuv420p10le,scale=1920:1080:flags=lanczos"
@@ -657,8 +651,6 @@ func parseFFmpegProgress(stdout io.Reader, key, outPath string, duration float64
             }
         } else if strings.HasPrefix(line, "speed=") {
             speed = strings.TrimSpace(strings.TrimPrefix(line, "speed="))
-        } else if strings.HasPrefix(line, "progress=end") {
-            return
         }
     }
 }
