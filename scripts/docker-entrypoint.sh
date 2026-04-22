@@ -4,11 +4,11 @@ set -eu
 case "${1:-}" in
   plan)
     shift
-    exec python3 /app/plan_transcodes.py "$@"
+    exec python3 /app/scripts/plan_transcodes.py "$@"
     ;;
   run)
     shift
-    exec python3 /app/run_transcodes.py "$@"
+    exec python3 /app/scripts/run_transcodes.py "$@"
     ;;
   ""|-h|--help|help)
     cat <<'EOF'

@@ -1,11 +1,17 @@
-# Batch Transcoder
+# Batch Transcoder (planner/runner)
 
-Simple Dockerized FFmpeg planner/runner.
+Dockerised FFmpeg workflow:
 
-## Commands
+- `plan` scans a media tree and writes:
+  - `transcode_jobs.jsonl` (source of truth for execution)
+  - `transcode_manifest.csv` (human-readable)
+  - `ffmpeg_commands.txt` (one command per line)
+- `run` executes `transcode_jobs.jsonl` with configurable concurrency and resumable state in `completed_jobs.jsonl`.
 
-- `plan` → scan media and generate job files
-- `run` → execute jobs from the JSONL jobs file
+## Project layout
+
+- `scripts/` contains the planner, runner and container entrypoint.
+- `work/` is a local scratch directory mounted into the container at `/work`.
 
 ## Build
 
@@ -13,17 +19,9 @@ Simple Dockerized FFmpeg planner/runner.
 docker compose build
 ```
 
-## Help
-
-```bash
-docker compose run --rm transcode
-docker compose run --rm transcode plan --help
-docker compose run --rm transcode run --help
-```
-
 ## Plan
 
-Example:
+Plan outputs next to sources (inside the mounted path):
 
 ```bash
 docker compose run --rm \
@@ -32,13 +30,7 @@ docker compose run --rm \
   plan /media
 ```
 
-Writes:
-
-- `ffmpeg_commands.txt`
-- `transcode_manifest.csv`
-- `transcode_jobs.jsonl`
-
-### Plan with separate output root
+Plan with a separate output root:
 
 ```bash
 docker compose run --rm \
@@ -48,34 +40,27 @@ docker compose run --rm \
   plan /media --output-root /encoded
 ```
 
-This preserves the directory structure from `/media` under `/encoded`.
+HDR behaviour:
+- Default: HDR/Dolby Vision sources are planned as SDR tonemapped outputs.
+- `--preserve-hdr`: keep HDR outputs instead.
+- `--add-sdr`: output both HDR and SDR (implies `--preserve-hdr`).
 
 ## Run
 
 ```bash
 docker compose run --rm \
   -v /path/to/media:/media \
+  -v /path/to/encoded:/encoded \
   transcode \
   run --concurrency 2
 ```
 
-## Resume behavior
+## Resume behaviour
 
-A job is complete only if:
-
-- ffmpeg exit code is `0`
-- output exists
-- output size is greater than `0`
+A job is considered complete only if:
+- ffmpeg exits with code `0`
+- output exists and has non-zero size
 
 On restart:
-
 - completed jobs are skipped
-- partial jobs are re-run
-- partial outputs are overwritten
-
-## Files
-
-- `transcode_jobs.jsonl` — source of truth for execution
-- `transcode_manifest.csv` — human-readable manifest
-- `ffmpeg_commands.txt` — one ffmpeg command per line
-- `completed_jobs.jsonl` — successful jobs
+- partial jobs are re-run (outputs overwritten)
