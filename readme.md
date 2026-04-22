@@ -4,10 +4,6 @@ Batch transcoder orchestrator (Go + Moby) that spawns an `ffprobe`/`ffmpeg` Dock
 
 ## Deployment
 
-### Prerequisites
-- Docker
-- Docker Compose
-
 ### Build
 Build the orchestrator image locally:
 
@@ -16,13 +12,9 @@ docker compose build
 ```
 
 ### Execution
-Start the proxy first:
+The proxy is automatically started due to `depends_on: dockerproxy` in our `transcoder` spesification.
 
-```bash
-docker compose up -d dockerproxy
-```
-
-Then run the transcoder as a one-shot process using `docker compose run`, passing volumes and environment overrides there:
+Run the transcoder as a one-shot process using `docker compose run`, passing volumes and environment overrides there:
 
 ```bash
 docker compose run --rm \
@@ -32,7 +24,7 @@ docker compose run --rm \
   transcoder
 ```
 
-Environment variables you may override:
+Environment variables you may wish to override:
 - `JOBS` (default: `2`): Maximum number of concurrent ffmpeg transcodes.
 - `FFMPEG_IMAGE` (default: `lscr.io/linuxserver/ffmpeg:latest`): ffmpeg container image to run.
 - `PULL_MISSING` (default: `true`): Pull the ffmpeg image if it is not present locally.
