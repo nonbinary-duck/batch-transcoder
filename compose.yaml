@@ -1,7 +1,6 @@
 services:
   dockerproxy:
     image: tecnativa/docker-socket-proxy:latest
-    container_name: dockerproxy
     restart: unless-stopped
     environment:
       LOG_LEVEL: info
@@ -25,7 +24,6 @@ services:
   transcoder:
     build: ./transcoder
     image: batch-transcoder:latest
-    container_name: batch-transcoder
     environment:
       DOCKER_HOST: tcp://dockerproxy:2375
       INPUT_DIR: /input

@@ -18,9 +18,7 @@ import (
     "time"
 
     "github.com/moby/moby/api/pkg/stdcopy"
-    "github.com/moby/moby/api/types"
     "github.com/moby/moby/api/types/container"
-    "github.com/moby/moby/api/types/image"
     "github.com/moby/moby/api/types/mount"
     "github.com/moby/moby/api/types/network"
     "github.com/moby/moby/client"
@@ -771,13 +769,13 @@ func detectHostBindSources(ctx context.Context, cli *client.Client, inputTarget,
         return "", "", err
     }
 
-    inspect, err := cli.ContainerInspect(ctx, selfID, types.ContainerInspectOptions{})
+    inspect, err := cli.ContainerInspect(ctx, selfID, client.ContainerInspectOptions{})
     if err != nil {
         return "", "", fmt.Errorf("container inspect self (%s): %w", selfID, err)
     }
 
     var hostIn, hostOut string
-    for _, m := range inspect.Mounts {
+    for _, m := range inspect.Container.Mounts {
         if m.Type != "bind" {
             continue
         }
@@ -853,27 +851,8 @@ func samePath(a, b string) bool {
     return aa == bb
 }
 
-func ensureImage(ctx context.Context, cli *client.Client, ref string) error {
-    // Try inspect first.
-    _, err := cli.ImageInspect(ctx, ref)
-    if err == nil {
-        return nil
-    }
-
-    // Pull.
-    resp, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
-    if err != nil {
-        return err
-    }
-    defer resp.Close()
-
-    // Drain reader so it completes.
-    _, _ = io.Copy(io.Discard, resp)
-    return nil
-}
 
 // Keep `image` import used (some builds require it in ensure-image evolutions). Avoid unused import.
-var _ = image.PullOptions{} // harmless reference; if this causes issues, delete both this and the image import.
 
 func exists(path string) bool {
     _, err := os.Stat(path)
