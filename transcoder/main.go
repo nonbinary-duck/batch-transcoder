@@ -30,18 +30,21 @@ const (
     defaultJobs        = 2
     defaultOutputRoot  = "/output"
     defaultInputRoot   = "/input"
+    defaultProgressDir = "/progress"
     defaultFFmpegImage = "lscr.io/linuxserver/ffmpeg:latest"
 )
 
 type AppConfig struct {
     InputDir      string
     OutputDir     string
+    ProgressDir   string
     FFmpegImage   string
     Concurrency   int
     PullIfMissing bool
 
-    HostInputDir  string // auto-detected by inspecting this container's bind mounts
-    HostOutputDir string
+    HostInputDir    string
+    HostOutputDir   string
+    HostProgressDir string
 }
 
 type FFProbe struct {
@@ -100,8 +103,8 @@ type ProgressEvent struct {
     Done    bool
     Err     error
 
-    MediaDurationSec float64 // duration of the media in seconds
-    WorkTotal        float64 // total work units for this output (pixels * seconds)
+    MediaDurationSec float64
+    WorkTotal        float64
 }
 
 type RunningState struct {
@@ -112,18 +115,49 @@ type RunningState struct {
     activeWorkTotal map[string]float64
     activeDurSec    map[string]float64
 
-    completed float64 // completed work units
-    total     float64 // total work units
+    completed float64
+    total     float64
 
     doneCount int
     wantCount int
     started   time.Time
 }
 
+type ActiveContainers struct {
+    mu  sync.Mutex
+    ids map[string]struct{}
+}
+
+func (a *ActiveContainers) Add(id string) {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    if a.ids == nil {
+        a.ids = make(map[string]struct{})
+    }
+    a.ids[id] = struct{}{}
+}
+
+func (a *ActiveContainers) Remove(id string) {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    delete(a.ids, id)
+}
+
+func (a *ActiveContainers) Snapshot() []string {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    out := make([]string, 0, len(a.ids))
+    for id := range a.ids {
+        out = append(out, id)
+    }
+    return out
+}
+
 func main() {
     cfg := AppConfig{
         InputDir:      getenv("INPUT_DIR", defaultInputRoot),
         OutputDir:     getenv("OUTPUT_DIR", defaultOutputRoot),
+        ProgressDir:   getenv("PROGRESS_DIR", defaultProgressDir),
         FFmpegImage:   getenv("FFMPEG_IMAGE", defaultFFmpegImage),
         Concurrency:   getenvInt("JOBS", defaultJobs),
         PullIfMissing: getenvBool("PULL_MISSING", true),
@@ -135,35 +169,49 @@ func main() {
     if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
         failf("create output dir: %v", err)
     }
+    if err := os.MkdirAll(cfg.ProgressDir, 0o755); err != nil {
+        failf("create progress dir: %v", err)
+    }
 
     cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
     if err != nil {
         failf("docker client init: %v", err)
     }
 
-    // Signal-aware context: Ctrl+C / SIGTERM cancels ffmpeg containers and exits cleanly.
     ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
     defer stop()
 
-    // Auto-detect host paths backing /input and /output by inspecting this container.
-    hostIn, hostOut, err := detectHostBindSources(ctx, cli, cfg.InputDir, cfg.OutputDir)
+    hostIn, hostOut, hostProg, err := detectHostMountSources(ctx, cli, cfg.InputDir, cfg.OutputDir, cfg.ProgressDir)
     if err != nil {
-        failf("detect bind mounts for %s and %s: %v", cfg.InputDir, cfg.OutputDir, err)
+        failf("detect mount sources: %v", err)
     }
     cfg.HostInputDir = hostIn
     cfg.HostOutputDir = hostOut
+    cfg.HostProgressDir = hostProg
 
     fmt.Printf("batch-transcoder\n")
-    fmt.Printf("Input (container):  %s  -> host: %s\n", cfg.InputDir, cfg.HostInputDir)
-    fmt.Printf("Output (container): %s  -> host: %s\n", cfg.OutputDir, cfg.HostOutputDir)
-    fmt.Printf("FFmpeg image:       %s\n", cfg.FFmpegImage)
-    fmt.Printf("Concurrency:        %d\n\n", cfg.Concurrency)
+    fmt.Printf("Input (container):    %s -> source: %s\n", cfg.InputDir, cfg.HostInputDir)
+    fmt.Printf("Output (container):   %s -> source: %s\n", cfg.OutputDir, cfg.HostOutputDir)
+    fmt.Printf("Progress (container): %s -> source: %s\n", cfg.ProgressDir, cfg.HostProgressDir)
+    fmt.Printf("FFmpeg image:         %s\n", cfg.FFmpegImage)
+    fmt.Printf("Concurrency:          %d\n\n", cfg.Concurrency)
 
     if cfg.PullIfMissing {
         if err := ensureImage(ctx, cli, cfg.FFmpegImage); err != nil {
             failf("ensure ffmpeg image: %v", err)
         }
     }
+
+    active := &ActiveContainers{ids: make(map[string]struct{})}
+
+    go func() {
+        <-ctx.Done()
+        cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+        defer cancel()
+        for _, id := range active.Snapshot() {
+            _ = forceRemoveContainer(cleanupCtx, cli, id)
+        }
+    }()
 
     jobs, err := discoverJobs(ctx, cli, cfg)
     if err != nil {
@@ -184,8 +232,6 @@ func main() {
         started:         time.Now(),
     }
 
-    // Total work units = durationSeconds * width * height (pixels*seconds)
-    // For 1080p variant, weight by 1920x1080 output resolution.
     for _, j := range jobs {
         state.total += workUnits(j.DurationSec, j.Width, j.Height)
         state.wantCount++
@@ -215,11 +261,10 @@ func main() {
         go func() {
             defer wg.Done()
             for job := range jobCh {
-                // Honour cancellation promptly.
                 if ctx.Err() != nil {
                     return
                 }
-                processJob(ctx, cli, cfg, job, progressCh)
+                processJob(ctx, cli, cfg, active, job, progressCh)
             }
         }()
     }
@@ -229,6 +274,8 @@ func main() {
         for _, j := range jobs {
             select {
             case <-ctx.Done():
+                close(jobCh)
+                wg.Wait()
                 return
             case jobCh <- j:
             }
@@ -243,7 +290,6 @@ func main() {
     for {
         select {
         case <-ctx.Done():
-            // Allow workers to exit; progressCh will close in producer goroutine.
             printOverall(state, true)
             fmt.Printf("\nCancelled: %v\n", ctx.Err())
             return
@@ -292,11 +338,11 @@ func discoverJobs(ctx context.Context, cli *client.Client, cfg AppConfig) ([]Job
         }
 
         isDV := hasDV(v)
-        isHDR := isHDR(v) || isDV
-        needs1080 := isHDR || v.Width >= 3840 || v.Height >= 2160
+        isHDRFlag := isHDR(v) || isDV
+        needs1080 := isHDRFlag || v.Width >= 3840 || v.Height >= 2160
 
         base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
-        hdrSuffix := isDV // only DV triggers tone-mapping/conversion hence .hdr suffix
+        hdrSuffix := isDV
 
         native := filepath.Join(cfg.OutputDir, buildOutputName(base, false, hdrSuffix))
         var out1080 string
@@ -315,7 +361,7 @@ func discoverJobs(ctx context.Context, cli *client.Client, cfg AppConfig) ([]Job
             DurationSec: dur,
             Width:       v.Width,
             Height:      v.Height,
-            IsHDR:       isHDR,
+            IsHDR:       isHDRFlag,
             IsDV:        isDV,
             Needs1080:   needs1080,
             NativeOut:   native,
@@ -325,14 +371,13 @@ func discoverJobs(ctx context.Context, cli *client.Client, cfg AppConfig) ([]Job
     return jobs, nil
 }
 
-func processJob(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, progressCh chan<- ProgressEvent) {
-    // Native output
+func processJob(ctx context.Context, cli *client.Client, cfg AppConfig, active *ActiveContainers, job Job, progressCh chan<- ProgressEvent) {
     {
         outW, outH := job.Width, job.Height
         workTotal := workUnits(job.DurationSec, outW, outH)
 
         if !exists(job.NativeOut) {
-            if err := runFFmpeg(ctx, cli, cfg, job, false, progressCh); err != nil {
+            if err := runFFmpeg(ctx, cli, cfg, active, job, false, progressCh); err != nil {
                 progressCh <- ProgressEvent{
                     Key:              labelFor(job, false),
                     OutPath:          job.NativeOut,
@@ -354,12 +399,11 @@ func processJob(ctx context.Context, cli *client.Client, cfg AppConfig, job Job,
         }
     }
 
-    // 1080p output (if required)
     if job.Needs1080 {
         workTotal := workUnits(job.DurationSec, 1920, 1080)
 
         if !exists(job.Out1080) {
-            if err := runFFmpeg(ctx, cli, cfg, job, true, progressCh); err != nil {
+            if err := runFFmpeg(ctx, cli, cfg, active, job, true, progressCh); err != nil {
                 progressCh <- ProgressEvent{
                     Key:              labelFor(job, true),
                     OutPath:          job.Out1080,
@@ -382,7 +426,7 @@ func processJob(ctx context.Context, cli *client.Client, cfg AppConfig, job Job,
     }
 }
 
-func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, make1080 bool, progressCh chan<- ProgressEvent) error {
+func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, active *ActiveContainers, job Job, make1080 bool, progressCh chan<- ProgressEvent) error {
     containerInput := job.InputPath
     containerOutput := job.NativeOut
     if make1080 {
@@ -395,16 +439,22 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     containerInputPath := filepath.Join("/work/input", inFile)
     containerOutputPath := filepath.Join("/work/output", outFile)
 
+    progressName := safeProgressFileName(labelFor(job, make1080)) + ".progress"
+    hostProgressPath := filepath.Join(cfg.ProgressDir, progressName)
+    containerProgressPath := filepath.Join("/work/progress", progressName)
+
+    _ = os.Remove(hostProgressPath)
+
     vf := buildFilter(job, make1080)
     x265 := buildX265Params()
 
-    // Prefer quiet stderr, progress on pipe:1.
     ffCmd := []string{
         "-hide_banner",
         "-nostdin",
         "-loglevel", "error",
         "-y",
-        "-progress", "pipe:1",
+        "-progress", containerProgressPath,
+        "-stats_period", "1",
         "-i", containerInputPath,
         "-map", "0",
         "-map_metadata", "0",
@@ -428,17 +478,16 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
 
     createRes, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
         Config: &container.Config{
-            Image:        cfg.FFmpegImage,
-            Cmd:          ffCmd,
-            Tty:          false,
-            AttachStdout: true,
-            AttachStderr: true,
+            Image: cfg.FFmpegImage,
+            Cmd:   ffCmd,
+            Tty:   false,
         },
         HostConfig: &container.HostConfig{
-            AutoRemove: true,
+            AutoRemove: false,
             Mounts: []mount.Mount{
                 {Type: mount.TypeBind, Source: cfg.HostInputDir, Target: "/work/input", ReadOnly: true},
                 {Type: mount.TypeBind, Source: cfg.HostOutputDir, Target: "/work/output", ReadOnly: false},
+                {Type: mount.TypeBind, Source: cfg.HostProgressDir, Target: "/work/progress", ReadOnly: false},
             },
             NetworkMode: "none",
             SecurityOpt: []string{"no-new-privileges:true"},
@@ -448,32 +497,17 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     if err != nil {
         return fmt.Errorf("container create: %w", err)
     }
-    id := createRes.ID
 
-    // IMPERATIVE cleanup: ensure container is stopped/removed on any exit path (Ctrl+C, errors, etc).
+    id := createRes.ID
+    active.Add(id)
+    defer active.Remove(id)
+
     defer func() {
         cctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
         defer cancel()
-
-        // Best-effort stop; then hard remove.
-        _, _ = cli.ContainerStop(cctx, id, client.ContainerStopOptions{})
-        _, _ = cli.ContainerRemove(cctx, id, client.ContainerRemoveOptions{
-            Force:         true,
-            RemoveVolumes: true,
-        })
+        _ = forceRemoveContainer(cctx, cli, id)
+        _ = os.Remove(hostProgressPath)
     }()
-
-    attachRes, err := cli.ContainerAttach(ctx, id, client.ContainerAttachOptions{
-        Stream: true,
-        Stdout: true,
-        Stderr: true,
-        // Logs=false avoids replaying old logs (not needed for a brand new container).
-        Logs: false,
-    })
-    if err != nil {
-        return fmt.Errorf("attach: %w", err)
-    }
-    defer attachRes.Close()
 
     if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
         return fmt.Errorf("container start: %w", err)
@@ -485,44 +519,34 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     }
     workTotal := workUnits(job.DurationSec, outW, outH)
 
-    // Parse progress from both demuxed streams.
-    doneLogs := make(chan struct{})
+    progressDone := make(chan struct{})
     go func() {
-        defer close(doneLogs)
-        stdoutR, stderrR := demuxAttach(attachRes.Reader)
-
-        var wg2 sync.WaitGroup
-        wg2.Add(2)
-
-        go func() {
-            defer wg2.Done()
-            parseFFmpegProgress(stdoutR, labelFor(job, make1080), containerOutput, job.DurationSec, workTotal, progressCh)
-        }()
-        go func() {
-            defer wg2.Done()
-            parseFFmpegProgress(stderrR, labelFor(job, make1080), containerOutput, job.DurationSec, workTotal, progressCh)
-        }()
-
-        wg2.Wait()
+        defer close(progressDone)
+        tailProgressFile(ctx, hostProgressPath, labelFor(job, make1080), containerOutput, job.DurationSec, workTotal, progressCh)
     }()
 
     waitRes := cli.ContainerWait(ctx, id, client.ContainerWaitOptions{
         Condition: container.WaitConditionNotRunning,
     })
+
     select {
     case err := <-waitRes.Error:
-        <-doneLogs
+        <-progressDone
         if err != nil {
-            // If ctx was cancelled, propagate it clearly.
             if ctx.Err() != nil {
                 return ctx.Err()
             }
             return fmt.Errorf("container wait error: %w", err)
         }
     case res := <-waitRes.Result:
-        <-doneLogs
+        <-progressDone
+        if res.Error != nil {
+            if ctx.Err() != nil {
+                return ctx.Err()
+            }
+            return fmt.Errorf("ffmpeg wait error: %s", res.Error.Message)
+        }
         if res.StatusCode != 0 {
-            // If ctx was cancelled, prefer ctx error.
             if ctx.Err() != nil {
                 return ctx.Err()
             }
@@ -539,6 +563,98 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
         WorkTotal:        workTotal,
     }
     return nil
+}
+
+func tailProgressFile(ctx context.Context, path, key, outPath string, duration float64, workTotal float64, ch chan<- ProgressEvent) {
+    deadline := time.Now().Add(30 * time.Second)
+    for {
+        if ctx.Err() != nil {
+            return
+        }
+        if exists(path) {
+            break
+        }
+        if time.Now().After(deadline) {
+            return
+        }
+        time.Sleep(200 * time.Millisecond)
+    }
+
+    f, err := os.Open(path)
+    if err != nil {
+        return
+    }
+    defer f.Close()
+
+    reader := bufio.NewReaderSize(f, 64*1024)
+    var speed string
+
+    for {
+        if ctx.Err() != nil {
+            return
+        }
+
+        line, err := reader.ReadString('\n')
+        if err != nil {
+            if errors.Is(err, io.EOF) {
+                time.Sleep(200 * time.Millisecond)
+                continue
+            }
+            return
+        }
+
+        line = strings.TrimSpace(line)
+        if line == "" {
+            continue
+        }
+
+        eq := strings.IndexByte(line, '=')
+        if eq <= 0 {
+            continue
+        }
+        k := line[:eq]
+        v := strings.TrimSpace(line[eq+1:])
+
+        switch k {
+        case "speed":
+            speed = v
+        case "out_time_ms":
+            us, _ := strconv.ParseFloat(v, 64)
+            ch <- ProgressEvent{
+                Key:              key,
+                OutPath:          outPath,
+                Seconds:          us / 1_000_000.0,
+                Speed:            speed,
+                MediaDurationSec: duration,
+                WorkTotal:        workTotal,
+            }
+        case "out_time_us":
+            us, _ := strconv.ParseFloat(v, 64)
+            ch <- ProgressEvent{
+                Key:              key,
+                OutPath:          outPath,
+                Seconds:          us / 1_000_000.0,
+                Speed:            speed,
+                MediaDurationSec: duration,
+                WorkTotal:        workTotal,
+            }
+        case "out_time":
+            if sec, ok := parseFFmpegTime(v); ok {
+                ch <- ProgressEvent{
+                    Key:              key,
+                    OutPath:          outPath,
+                    Seconds:          sec,
+                    Speed:            speed,
+                    MediaDurationSec: duration,
+                    WorkTotal:        workTotal,
+                }
+            }
+        case "progress":
+            if v == "end" {
+                return
+            }
+        }
+    }
 }
 
 func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, containerInput string) (*FFProbe, error) {
@@ -563,7 +679,7 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, container
             AttachStderr: true,
         },
         HostConfig: &container.HostConfig{
-            AutoRemove: true,
+            AutoRemove: false,
             Mounts: []mount.Mount{
                 {Type: mount.TypeBind, Source: cfg.HostInputDir, Target: "/work/input", ReadOnly: true},
             },
@@ -577,12 +693,10 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, container
     }
     id := createRes.ID
 
-    // Ensure ffprobe container is removed even on cancel.
     defer func() {
         cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
         defer cancel()
-        _, _ = cli.ContainerStop(cctx, id, client.ContainerStopOptions{})
-        _, _ = cli.ContainerRemove(cctx, id, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
+        _ = forceRemoveContainer(cctx, cli, id)
     }()
 
     attachRes, err := cli.ContainerAttach(ctx, id, client.ContainerAttachOptions{
@@ -619,6 +733,12 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, container
             return nil, err
         }
     case res := <-waitRes.Result:
+        if res.Error != nil {
+            if ctx.Err() != nil {
+                return nil, ctx.Err()
+            }
+            return nil, fmt.Errorf("ffprobe wait error: %s", res.Error.Message)
+        }
         if res.StatusCode != 0 {
             if ctx.Err() != nil {
                 return nil, ctx.Err()
@@ -648,6 +768,18 @@ func ensureImage(ctx context.Context, cli *client.Client, ref string) error {
 
     _, _ = io.Copy(io.Discard, resp)
     return nil
+}
+
+func forceRemoveContainer(ctx context.Context, cli *client.Client, id string) error {
+    timeout := 0
+    _, _ = cli.ContainerStop(ctx, id, client.ContainerStopOptions{
+        Timeout: &timeout,
+    })
+    _, err := cli.ContainerRemove(ctx, id, client.ContainerRemoveOptions{
+        Force:         true,
+        RemoveVolumes: true,
+    })
+    return err
 }
 
 func selectVideo(meta *FFProbe) (ProbeStream, float64, error) {
@@ -703,9 +835,6 @@ func buildOutputName(base string, is1080 bool, hdrSuffix bool) string {
 }
 
 func buildFilter(job Job, make1080 bool) string {
-    // Behaviour:
-    // - only colour convert if Dolby Vision (DV -> HDR10-ish tonemap)
-    // - otherwise just scale (if 1080) and ensure yuv420p10le
     if job.IsDV {
         if make1080 {
             return "zscale=t=linear:npl=100,format=gbrpf32le,zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,tonemap=mobius:desat=0,zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc:range=limited,format=yuv420p10le,scale=1920:1080:flags=lanczos"
@@ -720,8 +849,6 @@ func buildFilter(job Job, make1080 bool) string {
 }
 
 func buildX265Params() string {
-    // Always signal HDR (as requested), even for SDR sources.
-    // Note: This is not a proper SDR->HDR grade; it's metadata signalling + 10-bit encode.
     return strings.Join([]string{
         "hdr-opt=1",
         "repeat-headers=1",
@@ -732,89 +859,6 @@ func buildX265Params() string {
     }, ":")
 }
 
-func demuxAttach(r io.Reader) (io.Reader, io.Reader) {
-    stdoutPr, stdoutPw := io.Pipe()
-    stderrPr, stderrPw := io.Pipe()
-
-    go func() {
-        defer stdoutPw.Close()
-        defer stderrPw.Close()
-        _, err := stdcopy.StdCopy(stdoutPw, stderrPw, r)
-        if err != nil {
-            _ = stdoutPw.CloseWithError(err)
-            _ = stderrPw.CloseWithError(err)
-        }
-    }()
-
-    return stdoutPr, stderrPr
-}
-
-// parseFFmpegProgress parses ffmpeg -progress key=value output.
-// Uses bufio.Reader rather than Scanner to avoid token size and newline edge cases.
-func parseFFmpegProgress(r io.Reader, key, outPath string, duration float64, workTotal float64, ch chan<- ProgressEvent) {
-    br := bufio.NewReaderSize(r, 64*1024)
-    var speed string
-
-    for {
-        line, err := br.ReadString('\n')
-        if len(line) > 0 {
-            line = strings.TrimSpace(line)
-            if line == "" {
-                // ignore
-            } else if eq := strings.IndexByte(line, '='); eq > 0 {
-                k := line[:eq]
-                v := strings.TrimSpace(line[eq+1:])
-
-                switch k {
-                case "out_time_ms":
-                    // ffmpeg historically reports microseconds in out_time_ms.
-                    us, _ := strconv.ParseFloat(v, 64)
-                    ch <- ProgressEvent{
-                        Key:              key,
-                        OutPath:          outPath,
-                        Seconds:          us / 1_000_000.0,
-                        Speed:            speed,
-                        MediaDurationSec: duration,
-                        WorkTotal:        workTotal,
-                    }
-                case "out_time_us":
-                    us, _ := strconv.ParseFloat(v, 64)
-                    ch <- ProgressEvent{
-                        Key:              key,
-                        OutPath:          outPath,
-                        Seconds:          us / 1_000_000.0,
-                        Speed:            speed,
-                        MediaDurationSec: duration,
-                        WorkTotal:        workTotal,
-                    }
-                case "out_time":
-                    if sec, ok := parseFFmpegTime(v); ok {
-                        ch <- ProgressEvent{
-                            Key:              key,
-                            OutPath:          outPath,
-                            Seconds:          sec,
-                            Speed:            speed,
-                            MediaDurationSec: duration,
-                            WorkTotal:        workTotal,
-                        }
-                    }
-                case "speed":
-                    speed = v
-                case "progress":
-                    if v == "end" {
-                        return
-                    }
-                }
-            }
-        }
-
-        if err != nil {
-            return // EOF or stream closed
-        }
-    }
-}
-
-// parseFFmpegTime parses "HH:MM:SS[.fraction]" into seconds.
 func parseFFmpegTime(s string) (float64, bool) {
     parts := strings.SplitN(s, ".", 2)
     hms := strings.Split(parts[0], ":")
@@ -841,7 +885,6 @@ func applyProgress(state *RunningState, ev ProgressEvent) {
     state.mu.Lock()
     defer state.mu.Unlock()
 
-    // Update metadata for this active key (useful for weighted overall % even before completion).
     if ev.MediaDurationSec > 0 {
         state.activeDurSec[ev.Key] = ev.MediaDurationSec
     }
@@ -876,7 +919,6 @@ func printOverall(state *RunningState, final bool) {
     state.mu.Lock()
     defer state.mu.Unlock()
 
-    // Weighted active work = sum( workTotal * (outTime / duration) )
     activeWork := 0.0
     for k, sec := range state.activeSec {
         dur := state.activeDurSec[k]
@@ -947,20 +989,30 @@ func labelFor(job Job, is1080 bool) string {
     return filepath.Base(job.InputPath) + " [native]"
 }
 
-func detectHostBindSources(ctx context.Context, cli *client.Client, inputTarget, outputTarget string) (string, string, error) {
+func safeProgressFileName(s string) string {
+    s = strings.ReplaceAll(s, "/", "_")
+    s = strings.ReplaceAll(s, "\\", "_")
+    s = strings.ReplaceAll(s, " ", "_")
+    s = strings.ReplaceAll(s, "[", "")
+    s = strings.ReplaceAll(s, "]", "")
+    s = strings.ReplaceAll(s, ":", "_")
+    return s
+}
+
+func detectHostMountSources(ctx context.Context, cli *client.Client, inputTarget, outputTarget, progressTarget string) (string, string, string, error) {
     selfID, err := selfContainerID()
     if err != nil {
-        return "", "", err
+        return "", "", "", err
     }
 
     inspect, err := cli.ContainerInspect(ctx, selfID, client.ContainerInspectOptions{})
     if err != nil {
-        return "", "", fmt.Errorf("container inspect self (%s): %w", selfID, err)
+        return "", "", "", fmt.Errorf("container inspect self (%s): %w", selfID, err)
     }
 
-    var hostIn, hostOut string
+    var hostIn, hostOut, hostProg string
     for _, m := range inspect.Container.Mounts {
-        if m.Type != "bind" {
+        if m.Type != "bind" && m.Type != "volume" {
             continue
         }
         if samePath(m.Destination, inputTarget) {
@@ -969,24 +1021,29 @@ func detectHostBindSources(ctx context.Context, cli *client.Client, inputTarget,
         if samePath(m.Destination, outputTarget) {
             hostOut = m.Source
         }
+        if samePath(m.Destination, progressTarget) {
+            hostProg = m.Source
+        }
     }
 
     if hostIn == "" {
-        return "", "", fmt.Errorf("could not find bind mount source for %s in self mounts", inputTarget)
+        return "", "", "", fmt.Errorf("could not find mount source for %s", inputTarget)
     }
     if hostOut == "" {
-        return "", "", fmt.Errorf("could not find bind mount source for %s in self mounts", outputTarget)
+        return "", "", "", fmt.Errorf("could not find mount source for %s", outputTarget)
     }
-    return hostIn, hostOut, nil
+    if hostProg == "" {
+        return "", "", "", fmt.Errorf("could not find mount source for %s", progressTarget)
+    }
+
+    return hostIn, hostOut, hostProg, nil
 }
 
 func selfContainerID() (string, error) {
-    // In Docker, HOSTNAME defaults to container ID (often 12 chars). Inspect accepts prefix.
     if v := strings.TrimSpace(os.Getenv("HOSTNAME")); v != "" {
         return v, nil
     }
 
-    // Fallback: parse /proc/self/cgroup for a 64-hex ID.
     b, err := os.ReadFile("/proc/self/cgroup")
     if err != nil {
         return "", fmt.Errorf("read /proc/self/cgroup: %w", err)
@@ -996,7 +1053,7 @@ func selfContainerID() (string, error) {
             return id, nil
         }
     }
-    return "", errors.New("could not determine container ID (HOSTNAME empty and no id in /proc/self/cgroup)")
+    return "", errors.New("could not determine container ID")
 }
 
 func findHex64(s string) string {

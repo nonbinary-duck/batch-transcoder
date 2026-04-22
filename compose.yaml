@@ -1,25 +1,22 @@
 services:
   dockerproxy:
     image: tecnativa/docker-socket-proxy:latest
-    restart: unless-stopped
     environment:
       LOG_LEVEL: info
 
-      # Required capabilities
       CONTAINERS: 1
       IMAGES: 1
       INFO: 1
       VERSION: 1
       POST: 1
+      DELETE: 1
 
-      # Needed for starting the ffprobe/ffmpeg containers
       ALLOW_START: 1
-
-      # Optional but reasonable for cleanup/retries
       ALLOW_STOP: 1
       ALLOW_RESTARTS: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
 
   transcoder:
     build: ./transcoder
@@ -28,8 +25,14 @@ services:
       DOCKER_HOST: tcp://dockerproxy:2375
       INPUT_DIR: /input
       OUTPUT_DIR: /output
+      PROGRESS_DIR: /progress
       JOBS: 2
       FFMPEG_IMAGE: lscr.io/linuxserver/ffmpeg:latest
       PULL_MISSING: "true"
     depends_on:
       - dockerproxy
+    volumes:
+      - progress_data:/progress
+
+volumes:
+  progress_data:
