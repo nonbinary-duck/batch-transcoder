@@ -20,9 +20,12 @@ docker compose build
 ```
 
 ## Run as your user (avoid root-owned outputs)
+<<<<<<< HEAD
+=======
 > [!WARNING]
 > This will fail (during the planner) with the error `PermissionError: [Errno 13] Permission denied: 'ffmpeg_commands.txt'`
 > If I fix it, I will remove this warning. Feel free to make a 5-min PR.
+>>>>>>> 0c98fcd (Fix markdown syntax)
 
 When you bind-mount host directories into a container, files created in the mount will be owned by the container user. To avoid root-owned files on your host, run the container with your current UID:GID.
 
