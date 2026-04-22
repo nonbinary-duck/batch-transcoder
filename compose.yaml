@@ -1,32 +1,37 @@
 services:
   dockerproxy:
     image: tecnativa/docker-socket-proxy:latest
-    container_name: villanelle-dockerproxy
+    container_name: dockerproxy
     restart: unless-stopped
     environment:
       LOG_LEVEL: info
 
-      # minimal needed for this app
+      # Required capabilities
       CONTAINERS: 1
       IMAGES: 1
       INFO: 1
       VERSION: 1
+      POST: 1
 
+      # Needed for starting the ffprobe/ffmpeg containers
+      ALLOW_START: 1
+
+      # Optional but reasonable for cleanup/retries
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
   transcoder:
     build: ./transcoder
+    image: batch-transcoder:latest
     container_name: batch-transcoder
-    restart: "no"
     environment:
       DOCKER_HOST: tcp://dockerproxy:2375
       INPUT_DIR: /input
       OUTPUT_DIR: /output
       JOBS: 2
       FFMPEG_IMAGE: lscr.io/linuxserver/ffmpeg:latest
-    volumes:
-      - /your/source:/input:ro
-      - /your/source/output:/output:rw
+      PULL_MISSING: "true"
     depends_on:
       - dockerproxy

@@ -33,29 +33,36 @@ Output files adopt the following suffix conventions:
 ## Deployment
 
 ### Prerequisites
-* Docker
+* Docker & Docker Compose
 
-### Configuration
-Adjust operational parameters via the `environment` block in `docker-compose.yml`:
-* `JOBS`: Maximum number of concurrent transcoding containers (Default: `2`).
-* `INPUT_DIR`: Absolute path to the source archive.
-* `OUTPUT_DIR`: Absolute path to the destination directory.
+### Building
+Build the orchestrator image locally:
+```bash
+docker compose build
+```
 
 ### Execution
-Initiate the orchestrator using Docker Compose:
-
+The orchestrator requires the Docker Socket Proxy to be running. Start the proxy first:
 ```bash
-# Build the Go orchestrator image
-docker compose build
-
-# Start the proxy and begin batch processing
-docker compose up
+docker compose up -d dockerproxy
 ```
 
-To run the orchestrator as a foreground, one-shot process:
+Then initiate batch processing using `docker compose run`. This allows you to specify your source and destination folders and any overrides for environment variables:
+
 ```bash
-docker compose run --rm transcoder
+docker compose run --rm \
+  [-v /path/to/your/files:/input:ro] \
+  -v /path/to/your/output:/output:rw \
+  -e JOBS=2 \
+  transcoder
 ```
+
+### Configuration
+Operational parameters can be adjusted via environment variables:
+* `JOBS`: Maximum number of concurrent transcoding containers (Default: `2`).
+* `INPUT_DIR`: Internal path for source files (Default: `/input`).
+* `OUTPUT_DIR`: Internal path for destination files (Default: `/output`).
+* `FFMPEG_IMAGE`: The ffmpeg image used for processing (Default: `lscr.io/linuxserver/ffmpeg:latest`).
 
 ## Caveats
 1. **SDR to HDR Upconversion:** By design, standard dynamic range (SDR) sources are flagged with HDR metadata without complex inverse tone-mapping. This satisfies specific archival uniformity requirements but may result in non-standard visual presentation on highly calibrated displays.

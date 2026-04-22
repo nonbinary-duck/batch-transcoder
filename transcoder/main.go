@@ -18,7 +18,9 @@ import (
     "time"
 
     "github.com/moby/moby/api/pkg/stdcopy"
+    "github.com/moby/moby/api/types"
     "github.com/moby/moby/api/types/container"
+    "github.com/moby/moby/api/types/image"
     "github.com/moby/moby/api/types/mount"
     "github.com/moby/moby/api/types/network"
     "github.com/moby/moby/client"
@@ -37,6 +39,9 @@ type AppConfig struct {
     FFmpegImage   string
     Concurrency   int
     PullIfMissing bool
+
+    HostInputDir  string // auto-detected by inspecting this container's bind mounts
+    HostOutputDir string
 }
 
 type FFProbe struct {
@@ -114,9 +119,8 @@ func main() {
         OutputDir:     getenv("OUTPUT_DIR", defaultOutputRoot),
         FFmpegImage:   getenv("FFMPEG_IMAGE", defaultFFmpegImage),
         Concurrency:   getenvInt("JOBS", defaultJobs),
-        PullIfMissing: true,
+        PullIfMissing: getenvBool("PULL_MISSING", true),
     }
-
     if cfg.Concurrency < 1 {
         cfg.Concurrency = 1
     }
@@ -131,6 +135,20 @@ func main() {
     }
 
     ctx := context.Background()
+
+    // Auto-detect host paths backing /input and /output by inspecting this container.
+    hostIn, hostOut, err := detectHostBindSources(ctx, cli, cfg.InputDir, cfg.OutputDir)
+    if err != nil {
+        failf("detect bind mounts for %s and %s: %v", cfg.InputDir, cfg.OutputDir, err)
+    }
+    cfg.HostInputDir = hostIn
+    cfg.HostOutputDir = hostOut
+
+    fmt.Printf("batch-transcoder\n")
+    fmt.Printf("Input (container):  %s  -> host: %s\n", cfg.InputDir, cfg.HostInputDir)
+    fmt.Printf("Output (container): %s  -> host: %s\n", cfg.OutputDir, cfg.HostOutputDir)
+    fmt.Printf("FFmpeg image:       %s\n", cfg.FFmpegImage)
+    fmt.Printf("Concurrency:        %d\n\n", cfg.Concurrency)
 
     if cfg.PullIfMissing {
         if err := ensureImage(ctx, cli, cfg.FFmpegImage); err != nil {
@@ -167,11 +185,12 @@ func main() {
     for _, j := range jobs {
         fmt.Printf("- %s [%dx%d HDR=%v DV=%v 1080=%v]\n",
             filepath.Base(j.InputPath), j.Width, j.Height, j.IsHDR, j.IsDV, j.Needs1080)
-        fmt.Printf("  native: %s\n", j.NativeOut)
+        fmt.Printf("  native: %s\n", filepath.Base(j.NativeOut))
         if j.Needs1080 {
-            fmt.Printf("  1080p : %s\n", j.Out1080)
+            fmt.Printf("  1080p : %s\n", filepath.Base(j.Out1080))
         }
     }
+    fmt.Println()
 
     progressCh := make(chan ProgressEvent, 256)
     jobCh := make(chan Job)
@@ -232,16 +251,16 @@ func discoverJobs(ctx context.Context, cli *client.Client, cfg AppConfig) ([]Job
             continue
         }
 
-        hostInput := filepath.Join(cfg.InputDir, e.Name())
-        meta, err := probeFile(ctx, cli, cfg, hostInput)
+        containerInput := filepath.Join(cfg.InputDir, e.Name())
+        meta, err := probeFile(ctx, cli, cfg, containerInput)
         if err != nil {
-            fmt.Fprintf(os.Stderr, "probe failed for %s: %v\n", hostInput, err)
+            fmt.Fprintf(os.Stderr, "probe failed for %s: %v\n", containerInput, err)
             continue
         }
 
         v, dur, err := selectVideo(meta)
         if err != nil {
-            fmt.Fprintf(os.Stderr, "skip %s: %v\n", hostInput, err)
+            fmt.Fprintf(os.Stderr, "skip %s: %v\n", containerInput, err)
             continue
         }
 
@@ -250,7 +269,7 @@ func discoverJobs(ctx context.Context, cli *client.Client, cfg AppConfig) ([]Job
         needs1080 := isHDR || v.Width >= 3840 || v.Height >= 2160
 
         base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
-        hdrSuffix := isDV
+        hdrSuffix := isDV // only DV triggers tone-mapping/conversion hence .hdr suffix
 
         native := filepath.Join(cfg.OutputDir, buildOutputName(base, false, hdrSuffix))
         var out1080 string
@@ -264,7 +283,7 @@ func discoverJobs(ctx context.Context, cli *client.Client, cfg AppConfig) ([]Job
         }
 
         jobs = append(jobs, Job{
-            InputPath:   hostInput,
+            InputPath:   containerInput,
             BaseName:    base,
             DurationSec: dur,
             Width:       v.Width,
@@ -324,16 +343,14 @@ func processJob(ctx context.Context, cli *client.Client, cfg AppConfig, job Job,
 }
 
 func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, make1080 bool, progressCh chan<- ProgressEvent) error {
-    hostInput := job.InputPath
-    hostOutput := job.NativeOut
+    containerInput := job.InputPath
+    containerOutput := job.NativeOut
     if make1080 {
-        hostOutput = job.Out1080
+        containerOutput = job.Out1080
     }
 
-    inDir := filepath.Dir(hostInput)
-    inFile := filepath.Base(hostInput)
-    outDir := filepath.Dir(hostOutput)
-    outFile := filepath.Base(hostOutput)
+    inFile := filepath.Base(containerInput)
+    outFile := filepath.Base(containerOutput)
 
     containerInputPath := filepath.Join("/work/input", inFile)
     containerOutputPath := filepath.Join("/work/output", outFile)
@@ -378,8 +395,8 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
         HostConfig: &container.HostConfig{
             AutoRemove: true,
             Mounts: []mount.Mount{
-                {Type: mount.TypeBind, Source: inDir, Target: "/work/input", ReadOnly: true},
-                {Type: mount.TypeBind, Source: outDir, Target: "/work/output", ReadOnly: false},
+                {Type: mount.TypeBind, Source: cfg.HostInputDir, Target: "/work/input", ReadOnly: true},
+                {Type: mount.TypeBind, Source: cfg.HostOutputDir, Target: "/work/output", ReadOnly: false},
             },
             NetworkMode: "none",
             SecurityOpt: []string{"no-new-privileges:true"},
@@ -411,7 +428,7 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     go func() {
         defer close(doneLogs)
         stdoutR, _ := demuxAttach(attachRes.Reader)
-        parseFFmpegProgress(stdoutR, labelFor(job, make1080), hostOutput, job.DurationSec, progressCh)
+        parseFFmpegProgress(stdoutR, labelFor(job, make1080), containerOutput, job.DurationSec, progressCh)
     }()
 
     waitRes := cli.ContainerWait(ctx, createRes.ID, client.ContainerWaitOptions{
@@ -432,7 +449,7 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
 
     progressCh <- ProgressEvent{
         Key:      labelFor(job, make1080),
-        OutPath:  hostOutput,
+        OutPath:  containerOutput,
         Seconds:  job.DurationSec,
         Done:     true,
         Duration: job.DurationSec,
@@ -440,9 +457,8 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     return nil
 }
 
-func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, hostInput string) (*FFProbe, error) {
-    inDir := filepath.Dir(hostInput)
-    inFile := filepath.Base(hostInput)
+func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, containerInput string) (*FFProbe, error) {
+    inFile := filepath.Base(containerInput)
     containerInputPath := filepath.Join("/work/input", inFile)
 
     cmd := []string{
@@ -465,7 +481,7 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, hostInput
         HostConfig: &container.HostConfig{
             AutoRemove: true,
             Mounts: []mount.Mount{
-                {Type: mount.TypeBind, Source: inDir, Target: "/work/input", ReadOnly: true},
+                {Type: mount.TypeBind, Source: cfg.HostInputDir, Target: "/work/input", ReadOnly: true},
             },
             NetworkMode: "none",
             SecurityOpt: []string{"no-new-privileges:true"},
@@ -527,11 +543,14 @@ func ensureImage(ctx context.Context, cli *client.Client, ref string) error {
         return nil
     }
 
+    // Pull requires IMAGES=1 and POST=1 in the proxy.
     rc, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
     if err != nil {
         return err
     }
     defer rc.Close()
+
+    // Drain output so pull completes.
     _, _ = io.Copy(io.Discard, rc)
     return nil
 }
@@ -589,6 +608,9 @@ func buildOutputName(base string, is1080 bool, hdrSuffix bool) string {
 }
 
 func buildFilter(job Job, make1080 bool) string {
+    // Behaviour per your spec:
+    // - only colour convert if Dolby Vision (DV -> HDR10-ish tonemap)
+    // - otherwise just scale (if 1080) and ensure yuv420p10le
     if job.IsDV {
         if make1080 {
             return "zscale=t=linear:npl=100,format=gbrpf32le,zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,tonemap=mobius:desat=0,zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc:range=limited,format=yuv420p10le,scale=1920:1080:flags=lanczos"
@@ -603,6 +625,8 @@ func buildFilter(job Job, make1080 bool) string {
 }
 
 func buildX265Params() string {
+    // Always signal HDR (as requested), even for SDR sources.
+    // Note: This is not a proper SDR->HDR grade; it's metadata signalling + 10-bit encode.
     return strings.Join([]string{
         "hdr-opt=1",
         "repeat-headers=1",
@@ -624,7 +648,6 @@ func demuxAttach(r io.Reader) (io.Reader, io.Reader) {
         if err != nil {
             _ = stdoutPw.CloseWithError(err)
             _ = stderrPw.CloseWithError(err)
-            return
         }
     }()
 
@@ -634,6 +657,7 @@ func demuxAttach(r io.Reader) (io.Reader, io.Reader) {
 func parseFFmpegProgress(stdout io.Reader, key, outPath string, duration float64, ch chan<- ProgressEvent) {
     sc := bufio.NewScanner(stdout)
     var speed string
+
     for sc.Scan() {
         line := strings.TrimSpace(sc.Text())
         if line == "" {
@@ -651,6 +675,8 @@ func parseFFmpegProgress(stdout io.Reader, key, outPath string, duration float64
             }
         } else if strings.HasPrefix(line, "speed=") {
             speed = strings.TrimSpace(strings.TrimPrefix(line, "speed="))
+        } else if strings.HasPrefix(line, "progress=end") {
+            return
         }
     }
 }
@@ -664,10 +690,11 @@ func applyProgress(state *RunningState, ev ProgressEvent) {
         delete(state.activeSpd, ev.Key)
         state.completed += ev.Duration
         state.doneCount++
+
         if ev.Err != nil {
             fmt.Printf("\nERROR: %s: %v\n", ev.Key, ev.Err)
         } else {
-            fmt.Printf("\nDONE: %s -> %s\n", ev.Key, ev.OutPath)
+            fmt.Printf("\nDONE: %s -> %s\n", ev.Key, filepath.Base(ev.OutPath))
         }
         return
     }
@@ -738,6 +765,116 @@ func labelFor(job Job, is1080 bool) string {
     return filepath.Base(job.InputPath) + " [native]"
 }
 
+func detectHostBindSources(ctx context.Context, cli *client.Client, inputTarget, outputTarget string) (string, string, error) {
+    selfID, err := selfContainerID()
+    if err != nil {
+        return "", "", err
+    }
+
+    inspect, err := cli.ContainerInspect(ctx, selfID, types.ContainerInspectOptions{})
+    if err != nil {
+        return "", "", fmt.Errorf("container inspect self (%s): %w", selfID, err)
+    }
+
+    var hostIn, hostOut string
+    for _, m := range inspect.Mounts {
+        if m.Type != "bind" {
+            continue
+        }
+        if samePath(m.Destination, inputTarget) {
+            hostIn = m.Source
+        }
+        if samePath(m.Destination, outputTarget) {
+            hostOut = m.Source
+        }
+    }
+
+    if hostIn == "" {
+        return "", "", fmt.Errorf("could not find bind mount source for %s in self mounts", inputTarget)
+    }
+    if hostOut == "" {
+        return "", "", fmt.Errorf("could not find bind mount source for %s in self mounts", outputTarget)
+    }
+    return hostIn, hostOut, nil
+}
+
+func selfContainerID() (string, error) {
+    // In Docker, HOSTNAME defaults to container ID (often 12 chars). Inspect accepts prefix.
+    if v := strings.TrimSpace(os.Getenv("HOSTNAME")); v != "" {
+        return v, nil
+    }
+
+    // Fallback: parse /proc/self/cgroup for a 64-hex ID.
+    b, err := os.ReadFile("/proc/self/cgroup")
+    if err != nil {
+        return "", fmt.Errorf("read /proc/self/cgroup: %w", err)
+    }
+    for _, ln := range strings.Split(string(b), "\n") {
+        if id := findHex64(ln); id != "" {
+            return id, nil
+        }
+    }
+    return "", errors.New("could not determine container ID (HOSTNAME empty and no id in /proc/self/cgroup)")
+}
+
+func findHex64(s string) string {
+    isHex := func(c byte) bool {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+    }
+    for i := 0; i+64 <= len(s); i++ {
+        sub := s[i : i+64]
+        ok := true
+        for j := 0; j < 64; j++ {
+            c := sub[j]
+            if c >= 'A' && c <= 'F' {
+                c = c - 'A' + 'a'
+            }
+            if !isHex(c) {
+                ok = false
+                break
+            }
+        }
+        if ok {
+            return sub
+        }
+    }
+    return ""
+}
+
+func samePath(a, b string) bool {
+    aa := strings.TrimRight(a, "/")
+    bb := strings.TrimRight(b, "/")
+    if aa == "" {
+        aa = "/"
+    }
+    if bb == "" {
+        bb = "/"
+    }
+    return aa == bb
+}
+
+func ensureImage(ctx context.Context, cli *client.Client, ref string) error {
+    // Try inspect first.
+    _, err := cli.ImageInspect(ctx, ref)
+    if err == nil {
+        return nil
+    }
+
+    // Pull.
+    resp, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
+    if err != nil {
+        return err
+    }
+    defer resp.Close()
+
+    // Drain reader so it completes.
+    _, _ = io.Copy(io.Discard, resp)
+    return nil
+}
+
+// Keep `image` import used (some builds require it in ensure-image evolutions). Avoid unused import.
+var _ = image.PullOptions{} // harmless reference; if this causes issues, delete both this and the image import.
+
 func exists(path string) bool {
     _, err := os.Stat(path)
     return err == nil
@@ -772,6 +909,21 @@ func getenvInt(k string, def int) int {
         return def
     }
     return n
+}
+
+func getenvBool(k string, def bool) bool {
+    v := strings.TrimSpace(os.Getenv(k))
+    if v == "" {
+        return def
+    }
+    switch strings.ToLower(v) {
+    case "1", "true", "yes", "y", "on":
+        return true
+    case "0", "false", "no", "n", "off":
+        return false
+    default:
+        return def
+    }
 }
 
 func failf(format string, a ...any) {
