@@ -341,15 +341,15 @@ def parse_args():
         ),
     )
 
-    # add_sdr implies preserve_hdr
-    if args.add_sdr:
-        args.preserve_hdr = True
-
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # add_sdr implies preserve_hdr
+    if args.add_sdr:
+        args.preserve_hdr = True
 
     source_root = args.source_root.resolve()
     output_root = args.output_root.resolve() if args.output_root else None
