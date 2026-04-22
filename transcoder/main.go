@@ -91,21 +91,28 @@ type Job struct {
 }
 
 type ProgressEvent struct {
-    Key      string
-    OutPath  string
-    Seconds  float64
-    Speed    string
-    Done     bool
-    Err      error
-    Duration float64
+    Key     string
+    OutPath string
+    Seconds float64
+    Speed   string
+    Done    bool
+    Err     error
+
+    MediaDurationSec float64 // duration of the media in seconds
+    WorkTotal        float64 // total work units for this output (pixels * seconds)
 }
 
 type RunningState struct {
-    mu        sync.Mutex
-    activeSec map[string]float64
-    activeSpd map[string]string
-    completed float64
-    total     float64
+    mu sync.Mutex
+
+    activeSec       map[string]float64
+    activeSpd       map[string]string
+    activeWorkTotal map[string]float64
+    activeDurSec    map[string]float64
+
+    completed float64 // completed work units
+    total     float64 // total work units
+
     doneCount int
     wantCount int
     started   time.Time
@@ -166,23 +173,28 @@ func main() {
     sort.Slice(jobs, func(i, j int) bool { return jobs[i].DurationSec > jobs[j].DurationSec })
 
     state := &RunningState{
-        activeSec: make(map[string]float64),
-        activeSpd: make(map[string]string),
-        started:   time.Now(),
+        activeSec:       make(map[string]float64),
+        activeSpd:       make(map[string]string),
+        activeWorkTotal: make(map[string]float64),
+        activeDurSec:    make(map[string]float64),
+        started:         time.Now(),
     }
+
+    // Total work units = durationSeconds * width * height (pixels*seconds)
+    // For 1080p variant, weight by 1920x1080 output resolution.
     for _, j := range jobs {
-        state.total += j.DurationSec
+        state.total += workUnits(j.DurationSec, j.Width, j.Height)
         state.wantCount++
         if j.Needs1080 {
-            state.total += j.DurationSec
+            state.total += workUnits(j.DurationSec, 1920, 1080)
             state.wantCount++
         }
     }
 
     fmt.Printf("Queued %d source file(s)\n", len(jobs))
     for _, j := range jobs {
-        fmt.Printf("- %s [%dx%d HDR=%v DV=%v 1080=%v]\n",
-            filepath.Base(j.InputPath), j.Width, j.Height, j.IsHDR, j.IsDV, j.Needs1080)
+        fmt.Printf("- %s [%dx%d dur=%s HDR=%v DV=%v 1080=%v]\n",
+            filepath.Base(j.InputPath), j.Width, j.Height, fmtDurSeconds(j.DurationSec), j.IsHDR, j.IsDV, j.Needs1080)
         fmt.Printf("  native: %s\n", filepath.Base(j.NativeOut))
         if j.Needs1080 {
             fmt.Printf("  1080p : %s\n", filepath.Base(j.Out1080))
@@ -297,44 +309,57 @@ func discoverJobs(ctx context.Context, cli *client.Client, cfg AppConfig) ([]Job
 }
 
 func processJob(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, progressCh chan<- ProgressEvent) {
-    if !exists(job.NativeOut) {
-        if err := runFFmpeg(ctx, cli, cfg, job, false, progressCh); err != nil {
-            progressCh <- ProgressEvent{
-                Key:      labelFor(job, false),
-                OutPath:  job.NativeOut,
-                Err:      err,
-                Done:     true,
-                Duration: job.DurationSec,
-            }
-        }
-    } else {
-        progressCh <- ProgressEvent{
-            Key:      labelFor(job, false),
-            OutPath:  job.NativeOut,
-            Seconds:  job.DurationSec,
-            Done:     true,
-            Duration: job.DurationSec,
-        }
-    }
+    // Native output
+    {
+        outW, outH := job.Width, job.Height
+        workTotal := workUnits(job.DurationSec, outW, outH)
 
-    if job.Needs1080 {
-        if !exists(job.Out1080) {
-            if err := runFFmpeg(ctx, cli, cfg, job, true, progressCh); err != nil {
+        if !exists(job.NativeOut) {
+            if err := runFFmpeg(ctx, cli, cfg, job, false, progressCh); err != nil {
                 progressCh <- ProgressEvent{
-                    Key:      labelFor(job, true),
-                    OutPath:  job.Out1080,
-                    Err:      err,
-                    Done:     true,
-                    Duration: job.DurationSec,
+                    Key:              labelFor(job, false),
+                    OutPath:          job.NativeOut,
+                    Err:              err,
+                    Done:             true,
+                    MediaDurationSec: job.DurationSec,
+                    WorkTotal:        workTotal,
                 }
             }
         } else {
             progressCh <- ProgressEvent{
-                Key:      labelFor(job, true),
-                OutPath:  job.Out1080,
-                Seconds:  job.DurationSec,
-                Done:     true,
-                Duration: job.DurationSec,
+                Key:              labelFor(job, false),
+                OutPath:          job.NativeOut,
+                Seconds:          job.DurationSec,
+                Done:             true,
+                MediaDurationSec: job.DurationSec,
+                WorkTotal:        workTotal,
+            }
+        }
+    }
+
+    // 1080p output (if required)
+    if job.Needs1080 {
+        workTotal := workUnits(job.DurationSec, 1920, 1080)
+
+        if !exists(job.Out1080) {
+            if err := runFFmpeg(ctx, cli, cfg, job, true, progressCh); err != nil {
+                progressCh <- ProgressEvent{
+                    Key:              labelFor(job, true),
+                    OutPath:          job.Out1080,
+                    Err:              err,
+                    Done:             true,
+                    MediaDurationSec: job.DurationSec,
+                    WorkTotal:        workTotal,
+                }
+            }
+        } else {
+            progressCh <- ProgressEvent{
+                Key:              labelFor(job, true),
+                OutPath:          job.Out1080,
+                Seconds:          job.DurationSec,
+                Done:             true,
+                MediaDurationSec: job.DurationSec,
+                WorkTotal:        workTotal,
             }
         }
     }
@@ -422,11 +447,31 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
         return fmt.Errorf("container start: %w", err)
     }
 
+    outW, outH := job.Width, job.Height
+    if make1080 {
+        outW, outH = 1920, 1080
+    }
+    workTotal := workUnits(job.DurationSec, outW, outH)
+
     doneLogs := make(chan struct{})
     go func() {
         defer close(doneLogs)
-        stdoutR, _ := demuxAttach(attachRes.Reader)
-        parseFFmpegProgress(stdoutR, labelFor(job, make1080), containerOutput, job.DurationSec, progressCh)
+        stdoutR, stderrR := demuxAttach(attachRes.Reader)
+
+        // Parse on both stdout and stderr; depending on ffmpeg/image, -progress can appear on either.
+        var wg2 sync.WaitGroup
+        wg2.Add(2)
+
+        go func() {
+            defer wg2.Done()
+            parseFFmpegProgress(stdoutR, labelFor(job, make1080), containerOutput, job.DurationSec, workTotal, progressCh)
+        }()
+        go func() {
+            defer wg2.Done()
+            parseFFmpegProgress(stderrR, labelFor(job, make1080), containerOutput, job.DurationSec, workTotal, progressCh)
+        }()
+
+        wg2.Wait()
     }()
 
     waitRes := cli.ContainerWait(ctx, createRes.ID, client.ContainerWaitOptions{
@@ -446,11 +491,12 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     }
 
     progressCh <- ProgressEvent{
-        Key:      labelFor(job, make1080),
-        OutPath:  containerOutput,
-        Seconds:  job.DurationSec,
-        Done:     true,
-        Duration: job.DurationSec,
+        Key:              labelFor(job, make1080),
+        OutPath:          containerOutput,
+        Seconds:          job.DurationSec,
+        Done:             true,
+        MediaDurationSec: job.DurationSec,
+        WorkTotal:        workTotal,
     }
     return nil
 }
@@ -541,15 +587,13 @@ func ensureImage(ctx context.Context, cli *client.Client, ref string) error {
         return nil
     }
 
-    // Pull requires IMAGES=1 and POST=1 in the proxy.
-    rc, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
+    resp, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
     if err != nil {
         return err
     }
-    defer rc.Close()
+    defer resp.Close()
 
-    // Drain output so pull completes.
-    _, _ = io.Copy(io.Discard, rc)
+    _, _ = io.Copy(io.Discard, resp)
     return nil
 }
 
@@ -606,7 +650,7 @@ func buildOutputName(base string, is1080 bool, hdrSuffix bool) string {
 }
 
 func buildFilter(job Job, make1080 bool) string {
-    // Behaviour per your spec:
+    // Behaviour:
     // - only colour convert if Dolby Vision (DV -> HDR10-ish tonemap)
     // - otherwise just scale (if 1080) and ensure yuv420p10le
     if job.IsDV {
@@ -652,10 +696,12 @@ func demuxAttach(r io.Reader) (io.Reader, io.Reader) {
     return stdoutPr, stderrPr
 }
 
-func parseFFmpegProgress(stdout io.Reader, key, outPath string, duration float64, ch chan<- ProgressEvent) {
-    sc := bufio.NewScanner(stdout)
-    var speed string
+func parseFFmpegProgress(r io.Reader, key, outPath string, duration float64, workTotal float64, ch chan<- ProgressEvent) {
+    sc := bufio.NewScanner(r)
+    buf := make([]byte, 0, 64*1024)
+    sc.Buffer(buf, 1024*1024)
 
+    var speed string
     for sc.Scan() {
         line := strings.TrimSpace(sc.Text())
         if line == "" {
@@ -665,11 +711,12 @@ func parseFFmpegProgress(stdout io.Reader, key, outPath string, duration float64
             v := strings.TrimPrefix(line, "out_time_ms=")
             us, _ := strconv.ParseFloat(v, 64)
             ch <- ProgressEvent{
-                Key:      key,
-                OutPath:  outPath,
-                Seconds:  us / 1000000.0,
-                Speed:    speed,
-                Duration: duration,
+                Key:              key,
+                OutPath:          outPath,
+                Seconds:          us / 1_000_000.0,
+                Speed:            speed,
+                MediaDurationSec: duration,
+                WorkTotal:        workTotal,
             }
         } else if strings.HasPrefix(line, "speed=") {
             speed = strings.TrimSpace(strings.TrimPrefix(line, "speed="))
@@ -683,10 +730,21 @@ func applyProgress(state *RunningState, ev ProgressEvent) {
     state.mu.Lock()
     defer state.mu.Unlock()
 
+    // Update metadata for this active key (useful for weighted overall % even before completion).
+    if ev.MediaDurationSec > 0 {
+        state.activeDurSec[ev.Key] = ev.MediaDurationSec
+    }
+    if ev.WorkTotal > 0 {
+        state.activeWorkTotal[ev.Key] = ev.WorkTotal
+    }
+
     if ev.Done {
         delete(state.activeSec, ev.Key)
         delete(state.activeSpd, ev.Key)
-        state.completed += ev.Duration
+        delete(state.activeWorkTotal, ev.Key)
+        delete(state.activeDurSec, ev.Key)
+
+        state.completed += ev.WorkTotal
         state.doneCount++
 
         if ev.Err != nil {
@@ -707,22 +765,36 @@ func printOverall(state *RunningState, final bool) {
     state.mu.Lock()
     defer state.mu.Unlock()
 
-    activeSum := 0.0
-    for _, v := range state.activeSec {
-        activeSum += v
+    // Weighted active work = sum( workTotal * (outTime / duration) )
+    activeWork := 0.0
+    for k, sec := range state.activeSec {
+        dur := state.activeDurSec[k]
+        tot := state.activeWorkTotal[k]
+        if dur <= 0 || tot <= 0 {
+            continue
+        }
+        frac := sec / dur
+        if frac < 0 {
+            frac = 0
+        }
+        if frac > 1 {
+            frac = 1
+        }
+        activeWork += tot * frac
     }
-    done := state.completed + activeSum
+
+    doneWork := state.completed + activeWork
 
     pct := 0.0
     if state.total > 0 {
-        pct = done / state.total * 100
+        pct = doneWork / state.total * 100
     }
     pct = math.Min(pct, 100.0)
 
     elapsed := time.Since(state.started)
     eta := time.Duration(0)
-    if done > 0 && !final {
-        totalEstimate := elapsed.Seconds() * (state.total / done)
+    if doneWork > 0 && !final {
+        totalEstimate := elapsed.Seconds() * (state.total / doneWork)
         remain := totalEstimate - elapsed.Seconds()
         if remain > 0 {
             eta = time.Duration(remain * float64(time.Second))
@@ -738,6 +810,7 @@ func printOverall(state *RunningState, final bool) {
     var b strings.Builder
     fmt.Fprintf(&b, "\rOverall: %6.2f%% | outputs %d/%d | elapsed %s | ETA %s",
         pct, state.doneCount, state.wantCount, fmtDur(elapsed), fmtDur(eta))
+
     if len(names) > 0 {
         b.WriteString(" | active: ")
         for i, n := range names {
@@ -851,9 +924,6 @@ func samePath(a, b string) bool {
     return aa == bb
 }
 
-
-// Keep `image` import used (some builds require it in ensure-image evolutions). Avoid unused import.
-
 func exists(path string) bool {
     _, err := os.Stat(path)
     return err == nil
@@ -868,6 +938,23 @@ func fmtDur(d time.Duration) string {
     m := int(d.Minutes()) % 60
     s := int(d.Seconds()) % 60
     return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+func fmtDurSeconds(sec float64) string {
+    if sec < 0 {
+        sec = 0
+    }
+    return fmtDur(time.Duration(sec * float64(time.Second)))
+}
+
+func workUnits(durationSec float64, w, h int) float64 {
+    if durationSec <= 0 {
+        durationSec = 1
+    }
+    if w <= 0 || h <= 0 {
+        w, h = 1, 1
+    }
+    return durationSec * float64(w) * float64(h)
 }
 
 func getenv(k, def string) string {
