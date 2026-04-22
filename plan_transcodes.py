@@ -105,15 +105,32 @@ def is_hdr(v: dict) -> bool:
     )
 
 
-def build_output_name(src: Path, variant: str, hdr_suffix: bool, crf: int) -> Path:
-    base = src.with_suffix("")
-    name = f"{base.name}.h265.crf{crf}"
+def build_output_name(src: Path, variant: str, hdr_suffix: bool, crf: int) -> str:
+    base = src.stem
+    name = f"{base}.h265.crf{crf}"
     if variant == "1080":
         name += ".1080"
     if hdr_suffix:
         name += ".hdr"
     name += ".mkv"
-    return src.parent / name
+    return name
+
+
+def resolve_output_path(
+    src: Path,
+    source_root: Path,
+    output_root: Path,
+    variant: str,
+    hdr_suffix: bool,
+    crf: int,
+):
+    filename = build_output_name(src, variant=variant, hdr_suffix=hdr_suffix, crf=crf)
+
+    if output_root is None:
+        return src.parent / filename
+
+    rel_parent = src.parent.relative_to(source_root)
+    return output_root / rel_parent / filename
 
 
 def build_filter(is_dv: bool, make_1080: bool) -> str:
@@ -205,8 +222,9 @@ def parse_args():
             "  1) a plain-text ffmpeg command list\n"
             "  2) a CSV manifest\n"
             "  3) a structured JSONL jobs file for the runner\n\n"
-            "Outputs are planned to sit next to their source files.\n"
-            "The JSONL jobs file is intended to be the source of truth for execution."
+            "By default, outputs are planned next to source files.\n"
+            "If --output-root is provided, outputs are written under that directory\n"
+            "while preserving source-relative subdirectories."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -215,6 +233,16 @@ def parse_args():
         "source_root",
         type=Path,
         help="Root directory to recursively scan for video files.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional root directory for transcoded outputs.\n"
+            "If omitted, outputs are written next to source files.\n"
+            "If provided, source-relative directory structure is preserved under this root."
+        ),
     )
     parser.add_argument(
         "--commands-file",
@@ -261,8 +289,7 @@ def parse_args():
         default=False,
         help=(
             "If set, generate 1080p variants for HDR/Dolby Vision sources.\n"
-            "Without this flag, 1080p variants are only generated when source dimensions are 4K or larger,\n"
-            "unless the HDR/DV logic below marks them as needing 1080."
+            "Without this flag, 1080p variants are generated only for 4K-or-larger sources."
         ),
     )
 
@@ -272,7 +299,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    source_root = args.source_root
+    source_root = args.source_root.resolve()
+    output_root = args.output_root.resolve() if args.output_root else None
     commands_file = args.commands_file
     manifest_file = args.manifest_file
     jobs_file = args.jobs_file
@@ -313,11 +341,17 @@ def main():
         duration_hms = fmt_hms(duration_seconds)
         dv = has_dv(v)
         hdr = is_hdr(v) or dv
-
         needs_1080 = (width >= 3840 or height >= 2160) or (args.always_1080_for_hdr and hdr)
         hdr_suffix = dv
 
-        native_out = build_output_name(src, variant="native", hdr_suffix=hdr_suffix, crf=args.crf)
+        native_out = resolve_output_path(
+            src=src,
+            source_root=source_root,
+            output_root=output_root,
+            variant="native",
+            hdr_suffix=hdr_suffix,
+            crf=args.crf,
+        )
         native_cmd = build_ffmpeg_command(
             src=src,
             dst=native_out,
@@ -327,7 +361,6 @@ def main():
             crf=args.crf,
             preset=args.preset,
         )
-
         native_job_id = f"{src}::native"
 
         commands.append(shell_join(native_cmd))
@@ -362,7 +395,14 @@ def main():
         })
 
         if needs_1080:
-            out_1080 = build_output_name(src, variant="1080", hdr_suffix=hdr_suffix, crf=args.crf)
+            out_1080 = resolve_output_path(
+                src=src,
+                source_root=source_root,
+                output_root=output_root,
+                variant="1080",
+                hdr_suffix=hdr_suffix,
+                crf=args.crf,
+            )
             cmd_1080 = build_ffmpeg_command(
                 src=src,
                 dst=out_1080,

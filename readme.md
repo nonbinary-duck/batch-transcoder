@@ -38,6 +38,18 @@ Writes:
 - `transcode_manifest.csv`
 - `transcode_jobs.jsonl`
 
+### Plan with separate output root
+
+```bash
+docker compose run --rm \
+  -v /path/to/media:/media \
+  -v /path/to/encoded:/encoded \
+  transcode \
+  plan /media --output-root /encoded
+```
+
+This preserves the directory structure from `/media` under `/encoded`.
+
 ## Run
 
 ```bash
