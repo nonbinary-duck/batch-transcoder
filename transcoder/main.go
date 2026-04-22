@@ -10,11 +10,13 @@ import (
     "io"
     "math"
     "os"
+    "os/signal"
     "path/filepath"
     "sort"
     "strconv"
     "strings"
     "sync"
+    "syscall"
     "time"
 
     "github.com/moby/moby/api/pkg/stdcopy"
@@ -139,7 +141,9 @@ func main() {
         failf("docker client init: %v", err)
     }
 
-    ctx := context.Background()
+    // Signal-aware context: Ctrl+C / SIGTERM cancels ffmpeg containers and exits cleanly.
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stop()
 
     // Auto-detect host paths backing /input and /output by inspecting this container.
     hostIn, hostOut, err := detectHostBindSources(ctx, cli, cfg.InputDir, cfg.OutputDir)
@@ -211,18 +215,26 @@ func main() {
         go func() {
             defer wg.Done()
             for job := range jobCh {
+                // Honour cancellation promptly.
+                if ctx.Err() != nil {
+                    return
+                }
                 processJob(ctx, cli, cfg, job, progressCh)
             }
         }()
     }
 
     go func() {
+        defer close(progressCh)
         for _, j := range jobs {
-            jobCh <- j
+            select {
+            case <-ctx.Done():
+                return
+            case jobCh <- j:
+            }
         }
         close(jobCh)
         wg.Wait()
-        close(progressCh)
     }()
 
     ticker := time.NewTicker(1 * time.Second)
@@ -230,6 +242,11 @@ func main() {
 
     for {
         select {
+        case <-ctx.Done():
+            // Allow workers to exit; progressCh will close in producer goroutine.
+            printOverall(state, true)
+            fmt.Printf("\nCancelled: %v\n", ctx.Err())
+            return
         case ev, ok := <-progressCh:
             if !ok {
                 printOverall(state, true)
@@ -381,9 +398,11 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     vf := buildFilter(job, make1080)
     x265 := buildX265Params()
 
+    // Prefer quiet stderr, progress on pipe:1.
     ffCmd := []string{
         "-hide_banner",
         "-nostdin",
+        "-loglevel", "error",
         "-y",
         "-progress", "pipe:1",
         "-i", containerInputPath,
@@ -429,21 +448,34 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     if err != nil {
         return fmt.Errorf("container create: %w", err)
     }
+    id := createRes.ID
 
-    attachRes, err := cli.ContainerAttach(ctx, createRes.ID, client.ContainerAttachOptions{
+    // IMPERATIVE cleanup: ensure container is stopped/removed on any exit path (Ctrl+C, errors, etc).
+    defer func() {
+        cctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+        defer cancel()
+
+        // Best-effort stop; then hard remove.
+        _, _ = cli.ContainerStop(cctx, id, client.ContainerStopOptions{})
+        _, _ = cli.ContainerRemove(cctx, id, client.ContainerRemoveOptions{
+            Force:         true,
+            RemoveVolumes: true,
+        })
+    }()
+
+    attachRes, err := cli.ContainerAttach(ctx, id, client.ContainerAttachOptions{
         Stream: true,
         Stdout: true,
         Stderr: true,
-        Logs:   true,
+        // Logs=false avoids replaying old logs (not needed for a brand new container).
+        Logs: false,
     })
     if err != nil {
-        _, _ = cli.ContainerRemove(context.Background(), createRes.ID, client.ContainerRemoveOptions{Force: true})
         return fmt.Errorf("attach: %w", err)
     }
     defer attachRes.Close()
 
-    if _, err := cli.ContainerStart(ctx, createRes.ID, client.ContainerStartOptions{}); err != nil {
-        _, _ = cli.ContainerRemove(context.Background(), createRes.ID, client.ContainerRemoveOptions{Force: true})
+    if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
         return fmt.Errorf("container start: %w", err)
     }
 
@@ -453,12 +485,12 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
     }
     workTotal := workUnits(job.DurationSec, outW, outH)
 
+    // Parse progress from both demuxed streams.
     doneLogs := make(chan struct{})
     go func() {
         defer close(doneLogs)
         stdoutR, stderrR := demuxAttach(attachRes.Reader)
 
-        // Parse on both stdout and stderr; depending on ffmpeg/image, -progress can appear on either.
         var wg2 sync.WaitGroup
         wg2.Add(2)
 
@@ -474,18 +506,26 @@ func runFFmpeg(ctx context.Context, cli *client.Client, cfg AppConfig, job Job, 
         wg2.Wait()
     }()
 
-    waitRes := cli.ContainerWait(ctx, createRes.ID, client.ContainerWaitOptions{
+    waitRes := cli.ContainerWait(ctx, id, client.ContainerWaitOptions{
         Condition: container.WaitConditionNotRunning,
     })
     select {
     case err := <-waitRes.Error:
         <-doneLogs
         if err != nil {
+            // If ctx was cancelled, propagate it clearly.
+            if ctx.Err() != nil {
+                return ctx.Err()
+            }
             return fmt.Errorf("container wait error: %w", err)
         }
     case res := <-waitRes.Result:
         <-doneLogs
         if res.StatusCode != 0 {
+            // If ctx was cancelled, prefer ctx error.
+            if ctx.Err() != nil {
+                return ctx.Err()
+            }
             return fmt.Errorf("ffmpeg exited with status %d", res.StatusCode)
         }
     }
@@ -535,21 +575,28 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, container
     if err != nil {
         return nil, err
     }
+    id := createRes.ID
 
-    attachRes, err := cli.ContainerAttach(ctx, createRes.ID, client.ContainerAttachOptions{
+    // Ensure ffprobe container is removed even on cancel.
+    defer func() {
+        cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        defer cancel()
+        _, _ = cli.ContainerStop(cctx, id, client.ContainerStopOptions{})
+        _, _ = cli.ContainerRemove(cctx, id, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
+    }()
+
+    attachRes, err := cli.ContainerAttach(ctx, id, client.ContainerAttachOptions{
         Stream: true,
         Stdout: true,
         Stderr: true,
-        Logs:   true,
+        Logs:   false,
     })
     if err != nil {
-        _, _ = cli.ContainerRemove(context.Background(), createRes.ID, client.ContainerRemoveOptions{Force: true})
         return nil, err
     }
     defer attachRes.Close()
 
-    if _, err := cli.ContainerStart(ctx, createRes.ID, client.ContainerStartOptions{}); err != nil {
-        _, _ = cli.ContainerRemove(context.Background(), createRes.ID, client.ContainerRemoveOptions{Force: true})
+    if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
         return nil, err
     }
 
@@ -560,16 +607,22 @@ func probeFile(ctx context.Context, cli *client.Client, cfg AppConfig, container
         return nil, err
     }
 
-    waitRes := cli.ContainerWait(ctx, createRes.ID, client.ContainerWaitOptions{
+    waitRes := cli.ContainerWait(ctx, id, client.ContainerWaitOptions{
         Condition: container.WaitConditionNotRunning,
     })
     select {
     case err := <-waitRes.Error:
         if err != nil {
+            if ctx.Err() != nil {
+                return nil, ctx.Err()
+            }
             return nil, err
         }
     case res := <-waitRes.Result:
         if res.StatusCode != 0 {
+            if ctx.Err() != nil {
+                return nil, ctx.Err()
+            }
             return nil, fmt.Errorf("ffprobe status %d: %s", res.StatusCode, stderr.String())
         }
     }
@@ -696,34 +749,92 @@ func demuxAttach(r io.Reader) (io.Reader, io.Reader) {
     return stdoutPr, stderrPr
 }
 
+// parseFFmpegProgress parses ffmpeg -progress key=value output.
+// Uses bufio.Reader rather than Scanner to avoid token size and newline edge cases.
 func parseFFmpegProgress(r io.Reader, key, outPath string, duration float64, workTotal float64, ch chan<- ProgressEvent) {
-    sc := bufio.NewScanner(r)
-    buf := make([]byte, 0, 64*1024)
-    sc.Buffer(buf, 1024*1024)
-
+    br := bufio.NewReaderSize(r, 64*1024)
     var speed string
-    for sc.Scan() {
-        line := strings.TrimSpace(sc.Text())
-        if line == "" {
-            continue
-        }
-        if strings.HasPrefix(line, "out_time_ms=") {
-            v := strings.TrimPrefix(line, "out_time_ms=")
-            us, _ := strconv.ParseFloat(v, 64)
-            ch <- ProgressEvent{
-                Key:              key,
-                OutPath:          outPath,
-                Seconds:          us / 1_000_000.0,
-                Speed:            speed,
-                MediaDurationSec: duration,
-                WorkTotal:        workTotal,
+
+    for {
+        line, err := br.ReadString('\n')
+        if len(line) > 0 {
+            line = strings.TrimSpace(line)
+            if line == "" {
+                // ignore
+            } else if eq := strings.IndexByte(line, '='); eq > 0 {
+                k := line[:eq]
+                v := strings.TrimSpace(line[eq+1:])
+
+                switch k {
+                case "out_time_ms":
+                    // ffmpeg historically reports microseconds in out_time_ms.
+                    us, _ := strconv.ParseFloat(v, 64)
+                    ch <- ProgressEvent{
+                        Key:              key,
+                        OutPath:          outPath,
+                        Seconds:          us / 1_000_000.0,
+                        Speed:            speed,
+                        MediaDurationSec: duration,
+                        WorkTotal:        workTotal,
+                    }
+                case "out_time_us":
+                    us, _ := strconv.ParseFloat(v, 64)
+                    ch <- ProgressEvent{
+                        Key:              key,
+                        OutPath:          outPath,
+                        Seconds:          us / 1_000_000.0,
+                        Speed:            speed,
+                        MediaDurationSec: duration,
+                        WorkTotal:        workTotal,
+                    }
+                case "out_time":
+                    if sec, ok := parseFFmpegTime(v); ok {
+                        ch <- ProgressEvent{
+                            Key:              key,
+                            OutPath:          outPath,
+                            Seconds:          sec,
+                            Speed:            speed,
+                            MediaDurationSec: duration,
+                            WorkTotal:        workTotal,
+                        }
+                    }
+                case "speed":
+                    speed = v
+                case "progress":
+                    if v == "end" {
+                        return
+                    }
+                }
             }
-        } else if strings.HasPrefix(line, "speed=") {
-            speed = strings.TrimSpace(strings.TrimPrefix(line, "speed="))
-        } else if strings.HasPrefix(line, "progress=end") {
-            return
+        }
+
+        if err != nil {
+            return // EOF or stream closed
         }
     }
+}
+
+// parseFFmpegTime parses "HH:MM:SS[.fraction]" into seconds.
+func parseFFmpegTime(s string) (float64, bool) {
+    parts := strings.SplitN(s, ".", 2)
+    hms := strings.Split(parts[0], ":")
+    if len(hms) != 3 {
+        return 0, false
+    }
+    h, err1 := strconv.Atoi(hms[0])
+    m, err2 := strconv.Atoi(hms[1])
+    sec, err3 := strconv.Atoi(hms[2])
+    if err1 != nil || err2 != nil || err3 != nil {
+        return 0, false
+    }
+    out := float64(h*3600 + m*60 + sec)
+    if len(parts) == 2 && parts[1] != "" {
+        frac, err := strconv.ParseFloat("0."+parts[1], 64)
+        if err == nil {
+            out += frac
+        }
+    }
+    return out, true
 }
 
 func applyProgress(state *RunningState, ev ProgressEvent) {
