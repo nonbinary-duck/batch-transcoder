@@ -1,44 +1,103 @@
-# batch-transcoder
+# Batch Transcoder
 
-Batch transcoder orchestrator (Go + Moby) that spawns an `ffprobe`/`ffmpeg` Docker container per command via a Docker socket proxy.
+Simple Dockerized FFmpeg planner/runner.
 
-## Deployment
+## Commands
 
-### Build
-Build the orchestrator image locally:
+- `plan` → scan media and generate job files
+- `run` → execute jobs from the JSONL jobs file
+
+## Build
 
 ```bash
 docker compose build
 ```
 
-### Execution
-The proxy is automatically started due to `depends_on: dockerproxy` in our `transcoder` spesification.
+## Help
 
-Run the transcoder as a one-shot process using `docker compose run`, passing volumes and environment overrides there:
+```bash
+docker compose run --rm transcode
+docker compose run --rm transcode plan --help
+docker compose run --rm transcode run --help
+```
+
+## Plan
+
+Example:
 
 ```bash
 docker compose run --rm \
-  -v /path/to/source:/input:ro \
-  -v /path/to/output:/output:rw \
-  -e JOBS=2 \
-  transcoder
+  -v /path/to/media:/media \
+  transcode \
+  plan /media
 ```
 
-Environment variables you may wish to override:
-- `JOBS` (default: `2`): Maximum number of concurrent ffmpeg transcodes.
-- `FFMPEG_IMAGE` (default: `lscr.io/linuxserver/ffmpeg:latest`): ffmpeg container image to run.
-- `PULL_MISSING` (default: `true`): Pull the ffmpeg image if it is not present locally.
+Writes:
 
-Notes:
-- `/input` and `/output` are container paths. The app automatically inspects its own container mounts to discover the corresponding host paths and uses those when creating ffprobe/ffmpeg containers.
+- `ffmpeg_commands.txt`
+- `transcode_manifest.csv`
+- `transcode_jobs.jsonl`
 
-## Output naming
-- Native output: `name.h265.crf18.mkv`
-- Extra 1080p output (HDR or 4K sources): `name.h265.crf18.1080.mkv`
-- If Dolby Vision is detected (colour-mapped to HDR10-ish): add `.hdr` before `.mkv`
-  - `name.h265.crf18.hdr.mkv`
-  - `name.h265.crf18.1080.hdr.mkv`
+## Run
 
-## Caveats
-1. **SDR to HDR signalling**: SDR sources are encoded and signalled as HDR (BT.2020/PQ) to satisfy your uniformity requirement. This is not a proper artistic SDR→HDR grade and may look non-standard on some displays.
-2. **Dolby Vision metadata**: Dolby Vision dynamic metadata (RPU) is not preserved. DV sources are tone-mapped to an HDR10-style output for compatibility.
+```bash
+docker compose run --rm \
+  -v /path/to/media:/media \
+  transcode \
+  run --concurrency 2
+```
+
+## Resume behavior
+
+A job is complete only if:
+
+- ffmpeg exit code is `0`
+- output exists
+- output size is greater than `0`
+
+On restart:
+
+- completed jobs are skipped
+- partial jobs are re-run
+- partial outputs are overwritten
+
+## Files
+
+- `transcode_jobs.jsonl` — source of truth for execution
+- `transcode_manifest.csv` — human-readable manifest
+- `ffmpeg_commands.txt` — one ffmpeg command per line
+- `completed_jobs.jsonl` — successful jobs
+```
+
+---
+
+# 5) Rebuild
+
+After adding the entrypoint:
+
+```bash
+docker compose build --no-cache
+```
+
+Then use:
+
+```bash
+docker compose run --rm transcode plan --help
+docker compose run --rm transcode run --help
+```
+
+---
+
+# 6) About the orphan warning
+
+This is harmless, but if you want to clean it up:
+
+```bash
+docker compose run --rm --remove-orphans transcode plan --help
+```
+
+or:
+
+```bash
+docker compose down --remove-orphans
+```

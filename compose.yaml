@@ -1,35 +1,9 @@
 services:
-  dockerproxy:
-    image: tecnativa/docker-socket-proxy:latest
-    restart: unless-stopped
-    environment:
-      LOG_LEVEL: info
-
-      # Required capabilities
-      CONTAINERS: 1
-      IMAGES: 1
-      INFO: 1
-      VERSION: 1
-      POST: 1
-
-      # Needed for starting the ffprobe/ffmpeg containers
-      ALLOW_START: 1
-
-      # Optional but reasonable for cleanup/retries
-      ALLOW_STOP: 1
-      ALLOW_RESTARTS: 1
+  transcode:
+    build: .
+    image: transcode-planner-runner:latest
+    working_dir: /work
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
-  transcoder:
-    build: ./transcoder
-    image: batch-transcoder:latest
-    environment:
-      DOCKER_HOST: tcp://dockerproxy:2375
-      INPUT_DIR: /input
-      OUTPUT_DIR: /output
-      JOBS: 2
-      FFMPEG_IMAGE: lscr.io/linuxserver/ffmpeg:latest
-      PULL_MISSING: "true"
-    depends_on:
-      - dockerproxy
+      - ./work:/work
+    stdin_open: true
+    tty: true
