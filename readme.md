@@ -1,69 +1,52 @@
-# Automated HEVC Archival Transcoder
+# batch-transcoder
 
-This repository contains a Go-based orchestration service designed for the automated batch transcoding of mixed-format video archives into High-Efficiency Video Coding (HEVC/H.265). The system enforces 10-bit colour depth and high-dynamic-range (HDR) colorimetry across all outputs, while strictly bounding computational constraints via Constant Rate Factor (CRF) encoding.
-
-The application leverages a container-in-container architecture, utilising the Moby Go SDK to spawn ephemeral FFmpeg instances via a heavily restricted Docker Socket Proxy, ensuring cryptographic and operational isolation of the transcoding processes.
-
-## System Architecture
-1. **Orchestrator (Go):** A compiled daemon that traverses the input directory, probes container and stream metadata, computes the required transcoding heuristics, and manages a bounded concurrent worker pool.
-2. **Socket Proxy:** A least-privilege Docker API proxy (based on HAProxy) that exposes only the specific API endpoints required to provision and destroy ephemeral containers, mitigating the security risks associated with exposing `/var/run/docker.sock`.
-3. **Ephemeral Transcoders:** Stateless `lscr.io/linuxserver/ffmpeg` containers spawned on-demand for `ffprobe` metadata extraction and `ffmpeg` encoding tasks.
-
-## Transcoding Heuristics & Colorimetry
-The system applies deterministic rulesets based on source stream characteristics:
-
-* **Target Codec:** `libx265` (HEVC) at CRF 18, `medium` preset.
-* **Colorimetry Enforcement:** All outputs are strictly encoded at 10-bit depth (`yuv420p10le`) and flagged with BT.2020 primaries, SMPTE ST 2084 (PQ) transfer characteristics, and BT.2020 non-constant luminance matrix, regardless of the source transfer function.
-* **Dolby Vision (DV) Handling:** Sources containing DV dynamic metadata (side data) are intercepted and subjected to a deterministic tone-mapping pipeline (via `zscale`) to produce an HDR10-compatible output.
-* **Resolution Scaling:** 
-  * A native-resolution output is generated for all files.
-  * If the source resolution is $\ge$ 4K (3840x2160) or natively HDR, a secondary downsampled 1080p output is additionally generated using the Lanczos resampling algorithm.
-
-### Output Nomenclature
-Output files adopt the following suffix conventions:
-* `*.h265.crf18.mkv`: Standard native output.
-* `*.h265.crf18.1080.mkv`: Downsampled 1080p output.
-* `*.hdr.mkv`: Indicates that active colour-mapping was applied (specifically for Dolby Vision sources converted to HDR10).
-
-## Security Considerations
-* **Restricted API Access:** The orchestrator communicates exclusively via a proxy where execution, volume manipulation, and unauthenticated build contexts are explicitly dropped.
-* **Immutable Inputs:** The source archive is mounted strictly as read-only (`ro`).
-* **Privilege Dropping:** Ephemeral containers are spawned with `no-new-privileges:true` and restricted network capabilities (`NetworkMode: "none"`).
+Batch transcoder orchestrator (Go + Moby) that spawns an `ffprobe`/`ffmpeg` Docker container per command via a Docker socket proxy.
 
 ## Deployment
 
 ### Prerequisites
-* Docker & Docker Compose
+- Docker
+- Docker Compose
 
-### Building
+### Build
 Build the orchestrator image locally:
+
 ```bash
 docker compose build
 ```
 
 ### Execution
-The orchestrator requires the Docker Socket Proxy to be running. Start the proxy first:
+Start the proxy first:
+
 ```bash
 docker compose up -d dockerproxy
 ```
 
-Then initiate batch processing using `docker compose run`. This allows you to specify your source and destination folders and any overrides for environment variables:
+Then run the transcoder as a one-shot process using `docker compose run`, passing volumes and environment overrides there:
 
 ```bash
 docker compose run --rm \
-  [-v /path/to/your/files:/input:ro] \
-  -v /path/to/your/output:/output:rw \
+  -v /path/to/source:/input:ro \
+  -v /path/to/output:/output:rw \
   -e JOBS=2 \
   transcoder
 ```
 
-### Configuration
-Operational parameters can be adjusted via environment variables:
-* `JOBS`: Maximum number of concurrent transcoding containers (Default: `2`).
-* `INPUT_DIR`: Internal path for source files (Default: `/input`).
-* `OUTPUT_DIR`: Internal path for destination files (Default: `/output`).
-* `FFMPEG_IMAGE`: The ffmpeg image used for processing (Default: `lscr.io/linuxserver/ffmpeg:latest`).
+Environment variables you may override:
+- `JOBS` (default: `2`): Maximum number of concurrent ffmpeg transcodes.
+- `FFMPEG_IMAGE` (default: `lscr.io/linuxserver/ffmpeg:latest`): ffmpeg container image to run.
+- `PULL_MISSING` (default: `true`): Pull the ffmpeg image if it is not present locally.
+
+Notes:
+- `/input` and `/output` are container paths. The app automatically inspects its own container mounts to discover the corresponding host paths and uses those when creating ffprobe/ffmpeg containers.
+
+## Output naming
+- Native output: `name.h265.crf18.mkv`
+- Extra 1080p output (HDR or 4K sources): `name.h265.crf18.1080.mkv`
+- If Dolby Vision is detected (colour-mapped to HDR10-ish): add `.hdr` before `.mkv`
+  - `name.h265.crf18.hdr.mkv`
+  - `name.h265.crf18.1080.hdr.mkv`
 
 ## Caveats
-1. **SDR to HDR Upconversion:** By design, standard dynamic range (SDR) sources are flagged with HDR metadata without complex inverse tone-mapping. This satisfies specific archival uniformity requirements but may result in non-standard visual presentation on highly calibrated displays.
-2. **Metadata Attrition:** Dolby Vision dynamic metadata (RPU) is deliberately stripped and approximated via tone-mapping to ensure playback compatibility across standard HDR10 architectures.
+1. **SDR to HDR signalling**: SDR sources are encoded and signalled as HDR (BT.2020/PQ) to satisfy your uniformity requirement. This is not a proper artistic SDR→HDR grade and may look non-standard on some displays.
+2. **Dolby Vision metadata**: Dolby Vision dynamic metadata (RPU) is not preserved. DV sources are tone-mapped to an HDR10-style output for compatibility.
