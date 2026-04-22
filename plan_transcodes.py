@@ -105,11 +105,13 @@ def is_hdr(v: dict) -> bool:
     )
 
 
-def build_output_name(src: Path, variant: str, hdr_suffix: bool, crf: int) -> str:
+def build_output_name(src: Path, variant: str, hdr_suffix: bool, crf: int, tonemapped: bool) -> str:
     base = src.stem
     name = f"{base}.h265.crf{crf}"
     if variant == "1080":
         name += ".1080"
+    if tonemapped:
+        name += ".tonemapped"
     if hdr_suffix:
         name += ".hdr"
     name += ".mkv"
@@ -123,8 +125,15 @@ def resolve_output_path(
     variant: str,
     hdr_suffix: bool,
     crf: int,
+    tonemapped: bool,
 ):
-    filename = build_output_name(src, variant=variant, hdr_suffix=hdr_suffix, crf=crf)
+    filename = build_output_name(
+        src,
+        variant=variant,
+        hdr_suffix=hdr_suffix,
+        crf=crf,
+        tonemapped=tonemapped,
+    )
 
     if output_root is None:
         return src.parent / filename
@@ -133,7 +142,23 @@ def resolve_output_path(
     return output_root / rel_parent / filename
 
 
-def build_filter(is_dv: bool, make_1080: bool) -> str:
+def build_filter(is_dv: bool, make_1080: bool, tonemap_to_sdr: bool) -> str:
+    # SDR tonemap pipeline based on the user-provided example.
+    # Keeps 10-bit output (yuv420p10le) like the example.
+    if tonemap_to_sdr:
+        chain = [
+            "zscale=t=linear:npl=100",
+            "format=gbrpf32le",
+            "zscale=p=bt709",
+            "tonemap=hable:desat=0",
+            "zscale=t=bt709:m=bt709:r=tv",
+            "format=yuv420p10le",
+        ]
+        if make_1080:
+            chain.append("scale=1920:1080:flags=lanczos")
+        return ",".join(chain)
+
+    # Preserve HDR/DV behaviour (existing logic)
     if is_dv:
         if make_1080:
             return (
@@ -185,9 +210,12 @@ def build_ffmpeg_command(
     make_1080: bool,
     crf: int,
     preset: str,
+    tonemap_to_sdr: bool,
 ):
-    vf = build_filter(is_dv=is_dv, make_1080=make_1080)
-    enable_hdr_signalling = is_dv or is_hdr_src
+    vf = build_filter(is_dv=is_dv, make_1080=make_1080, tonemap_to_sdr=tonemap_to_sdr)
+
+    # If tonemapping to SDR, do NOT signal HDR in x265 params.
+    enable_hdr_signalling = (not tonemap_to_sdr) and (is_dv or is_hdr_src)
 
     cmd = [
         "ffmpeg",
@@ -224,7 +252,9 @@ def parse_args():
             "  3) a structured JSONL jobs file for the runner\n\n"
             "By default, outputs are planned next to source files.\n"
             "If --output-root is provided, outputs are written under that directory\n"
-            "while preserving source-relative subdirectories."
+            "while preserving source-relative subdirectories.\n\n"
+            "HDR handling defaults to planning SDR tonemapped outputs for HDR/DV sources.\n"
+            "Use --preserve-hdr to keep HDR outputs instead, and --add-sdr to produce both."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -292,6 +322,28 @@ def parse_args():
             "Without this flag, 1080p variants are generated only for 4K-or-larger sources."
         ),
     )
+    parser.add_argument(
+        "--preserve-hdr",
+        action="store_true",
+        default=False,
+        help=(
+            "Preserve HDR/Dolby Vision signalling for HDR sources. "
+            "By default, HDR sources are planned as SDR tonemapped outputs."
+        ),
+    )
+    parser.add_argument(
+        "--add-sdr",
+        action="store_true",
+        default=False,
+        help=(
+            "For HDR/Dolby Vision sources, add an additional SDR tonemapped output. "
+            "Implies --preserve-hdr."
+        ),
+    )
+
+    # add_sdr implies preserve_hdr
+    if args.add_sdr:
+        args.preserve_hdr = True
 
     return parser.parse_args()
 
@@ -339,111 +391,141 @@ def main():
         height = int(v.get("height") or 0)
         duration_seconds = parse_duration_seconds(meta)
         duration_hms = fmt_hms(duration_seconds)
+
         dv = has_dv(v)
-        hdr = is_hdr(v) or dv
-        needs_1080 = (width >= 3840 or height >= 2160) or (args.always_1080_for_hdr and hdr)
-        hdr_suffix = dv
+        hdr_src = is_hdr(v) or dv
 
-        native_out = resolve_output_path(
-            src=src,
-            source_root=source_root,
-            output_root=output_root,
-            variant="native",
-            hdr_suffix=hdr_suffix,
-            crf=args.crf,
-        )
-        native_cmd = build_ffmpeg_command(
-            src=src,
-            dst=native_out,
-            is_dv=dv,
-            is_hdr_src=hdr,
-            make_1080=False,
-            crf=args.crf,
-            preset=args.preset,
-        )
-        native_job_id = f"{src}::native"
+        needs_1080 = (width >= 3840 or height >= 2160) or (args.always_1080_for_hdr and hdr_src)
 
-        commands.append(shell_join(native_cmd))
-        jobs.append({
-            "job_id": native_job_id,
-            "source": str(src),
-            "output": str(native_out),
-            "variant": "native",
-            "width": width,
-            "height": height,
-            "duration_seconds": duration_seconds,
-            "duration_hms": duration_hms,
-            "heightxwidthxtime": f"{height}x{width}x{duration_hms}",
-            "is_hdr": hdr,
-            "is_dv": dv,
-            "needs_1080": needs_1080,
-            "command": native_cmd,
-        })
-        manifest_rows.append({
-            "job_id": native_job_id,
-            "source": str(src),
-            "output": str(native_out),
-            "variant": "native",
-            "width": width,
-            "height": height,
-            "duration_seconds": f"{duration_seconds:.3f}",
-            "duration_hms": duration_hms,
-            "heightxwidthxtime": f"{height}x{width}x{duration_hms}",
-            "is_hdr": str(hdr).lower(),
-            "is_dv": str(dv).lower(),
-            "needs_1080": str(needs_1080).lower(),
-        })
+        # Decide outputs:
+        # - SDR sources: one output, no tonemap, no HDR suffix.
+        # - HDR/DV sources:
+        #     default: SDR tonemapped only
+        #     --preserve-hdr: HDR only
+        #     --add-sdr: HDR + SDR tonemapped (and implies preserve-hdr)
+        outputs_to_make = []
 
-        if needs_1080:
-            out_1080 = resolve_output_path(
+        if hdr_src:
+            if args.preserve_hdr:
+                # HDR output
+                outputs_to_make.append(("hdr", False, True))  # label, tonemap_to_sdr, hdr_suffix
+            if (not args.preserve_hdr) or args.add_sdr:
+                # SDR tonemapped output
+                outputs_to_make.append(("sdr", True, False))
+        else:
+            outputs_to_make.append(("sdr_src", False, False))
+
+        for label, tonemap_to_sdr, hdr_suffix in outputs_to_make:
+            tonemapped = bool(tonemap_to_sdr)
+
+            # Native
+            native_out = resolve_output_path(
                 src=src,
                 source_root=source_root,
                 output_root=output_root,
-                variant="1080",
+                variant="native",
                 hdr_suffix=hdr_suffix,
                 crf=args.crf,
+                tonemapped=tonemapped,
             )
-            cmd_1080 = build_ffmpeg_command(
+            native_cmd = build_ffmpeg_command(
                 src=src,
-                dst=out_1080,
+                dst=native_out,
                 is_dv=dv,
-                is_hdr_src=hdr,
-                make_1080=True,
+                is_hdr_src=hdr_src,
+                make_1080=False,
                 crf=args.crf,
                 preset=args.preset,
+                tonemap_to_sdr=tonemap_to_sdr,
             )
-            job_1080_id = f"{src}::1080"
+            native_job_id = f"{src}::native::{label}"
 
-            commands.append(shell_join(cmd_1080))
+            commands.append(shell_join(native_cmd))
             jobs.append({
-                "job_id": job_1080_id,
+                "job_id": native_job_id,
                 "source": str(src),
-                "output": str(out_1080),
-                "variant": "1080",
+                "output": str(native_out),
+                "variant": "native",
                 "width": width,
                 "height": height,
                 "duration_seconds": duration_seconds,
                 "duration_hms": duration_hms,
                 "heightxwidthxtime": f"{height}x{width}x{duration_hms}",
-                "is_hdr": hdr,
-                "is_dv": dv,
+                "is_hdr": hdr_src and (not tonemap_to_sdr),
+                "is_dv": dv and (not tonemap_to_sdr),
                 "needs_1080": needs_1080,
-                "command": cmd_1080,
+                "tonemapped": tonemap_to_sdr,
+                "command": native_cmd,
             })
             manifest_rows.append({
-                "job_id": job_1080_id,
+                "job_id": native_job_id,
                 "source": str(src),
-                "output": str(out_1080),
-                "variant": "1080",
+                "output": str(native_out),
+                "variant": "native",
                 "width": width,
                 "height": height,
                 "duration_seconds": f"{duration_seconds:.3f}",
                 "duration_hms": duration_hms,
                 "heightxwidthxtime": f"{height}x{width}x{duration_hms}",
-                "is_hdr": str(hdr).lower(),
-                "is_dv": str(dv).lower(),
+                "is_hdr": str(hdr_src and (not tonemap_to_sdr)).lower(),
+                "is_dv": str(dv and (not tonemap_to_sdr)).lower(),
                 "needs_1080": str(needs_1080).lower(),
             })
+
+            # 1080
+            if needs_1080:
+                out_1080 = resolve_output_path(
+                    src=src,
+                    source_root=source_root,
+                    output_root=output_root,
+                    variant="1080",
+                    hdr_suffix=hdr_suffix,
+                    crf=args.crf,
+                    tonemapped=tonemapped,
+                )
+                cmd_1080 = build_ffmpeg_command(
+                    src=src,
+                    dst=out_1080,
+                    is_dv=dv,
+                    is_hdr_src=hdr_src,
+                    make_1080=True,
+                    crf=args.crf,
+                    preset=args.preset,
+                    tonemap_to_sdr=tonemap_to_sdr,
+                )
+                job_1080_id = f"{src}::1080::{label}"
+
+                commands.append(shell_join(cmd_1080))
+                jobs.append({
+                    "job_id": job_1080_id,
+                    "source": str(src),
+                    "output": str(out_1080),
+                    "variant": "1080",
+                    "width": width,
+                    "height": height,
+                    "duration_seconds": duration_seconds,
+                    "duration_hms": duration_hms,
+                    "heightxwidthxtime": f"{height}x{width}x{duration_hms}",
+                    "is_hdr": hdr_src and (not tonemap_to_sdr),
+                    "is_dv": dv and (not tonemap_to_sdr),
+                    "needs_1080": needs_1080,
+                    "tonemapped": tonemap_to_sdr,
+                    "command": cmd_1080,
+                })
+                manifest_rows.append({
+                    "job_id": job_1080_id,
+                    "source": str(src),
+                    "output": str(out_1080),
+                    "variant": "1080",
+                    "width": width,
+                    "height": height,
+                    "duration_seconds": f"{duration_seconds:.3f}",
+                    "duration_hms": duration_hms,
+                    "heightxwidthxtime": f"{height}x{width}x{duration_hms}",
+                    "is_hdr": str(hdr_src and (not tonemap_to_sdr)).lower(),
+                    "is_dv": str(dv and (not tonemap_to_sdr)).lower(),
+                    "needs_1080": str(needs_1080).lower(),
+                })
 
     commands_file.write_text("\n".join(commands) + ("\n" if commands else ""), encoding="utf-8")
 
