@@ -19,12 +19,23 @@ Dockerised FFmpeg workflow:
 docker compose build
 ```
 
+## Run as your user (avoid root-owned outputs)
+
+When you bind-mount host directories into a container, files created in the mount will be owned by the container user. To avoid root-owned files on your host, run the container with your current UID:GID.
+
+### Linux/macOS (Docker Engine)
+
+Use `--user "$(id -u):$(id -g)"` in commands below.
+
+> Note: On some macOS setups, ownership mapping behaves differently, but using `--user` is still a safe default.
+
 ## Plan
 
 Plan outputs next to sources (inside the mounted path):
 
 ```bash
 docker compose run --rm \
+  --user "$(id -u):$(id -g)" \
   -v /path/to/media:/media \
   transcode \
   plan /media
@@ -34,6 +45,7 @@ Plan with a separate output root:
 
 ```bash
 docker compose run --rm \
+  --user "$(id -u):$(id -g)" \
   -v /path/to/media:/media \
   -v /path/to/encoded:/encoded \
   transcode \
@@ -49,6 +61,7 @@ HDR behaviour:
 
 ```bash
 docker compose run --rm \
+  --user "$(id -u):$(id -g)" \
   -v /path/to/media:/media \
   -v /path/to/encoded:/encoded \
   transcode \
