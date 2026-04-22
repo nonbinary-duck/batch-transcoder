@@ -72,6 +72,7 @@ class ActiveState:
         self.done_count = 0
         self.total_count = 0
         self.started = time.time()
+        self.last_status_print = 0.0
 
     def set_totals(self, jobs):
         self.total_duration = sum(float(j.get("duration_seconds", 0.0) or 0.0) for j in jobs)
@@ -87,7 +88,6 @@ class ActiveState:
                 "duration": float(job.get("duration_seconds", 0.0) or 0.0),
                 "progress_seconds": 0.0,
                 "speed": "",
-                "status": "running",
                 "started": time.time(),
             }
 
@@ -117,6 +117,37 @@ class ActiveState:
                 "total_count": self.total_count,
                 "started": self.started,
             }
+
+
+def print_status(state: ActiveState):
+    snap = state.snapshot()
+    active = snap["active"]
+
+    active_sum = sum(min(v["progress_seconds"], v["duration"]) for v in active.values())
+    done = snap["completed_duration"] + active_sum
+    total = snap["total_duration"]
+    pct = (done / total * 100.0) if total > 0 else 0.0
+
+    elapsed = time.time() - snap["started"]
+    eta = 0.0
+    if done > 0:
+        est_total = elapsed * (total / done)
+        eta = max(0.0, est_total - elapsed)
+
+    print(
+        f"STATUS | overall {pct:6.2f}% | done {snap['done_count']}/{snap['total_count']} "
+        f"| elapsed {fmt_hms(elapsed)} | ETA {fmt_hms(eta)} | active {len(active)}"
+    )
+
+    for job_id in sorted(active.keys()):
+        j = active[job_id]
+        prog = min(j["progress_seconds"], j["duration"])
+        jpct = (prog / j["duration"] * 100.0) if j["duration"] > 0 else 0.0
+        print(
+            f"  RUNNING | {Path(j['source']).name} [{j['variant']}] "
+            f"{jpct:6.2f}% {fmt_hms(prog)}/{fmt_hms(j['duration'])} "
+            f"speed {j['speed'] or '?'}"
+        )
 
 
 def parse_progress_stream(stdout, job, state: ActiveState):
@@ -162,13 +193,16 @@ def worker(job_queue: queue.Queue, state: ActiveState, completed_set: set, compl
             already_complete = job_id in completed_set
 
         if already_complete and is_output_complete(output):
-            print(f"SKIP complete: {job_id}")
+            print(f"DONE (skip): {job_id} -> {output}")
             state.finish_job(job_id, duration, ok=True)
             job_queue.task_done()
             continue
 
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
         state.start_job(job)
         cmd = job["command"]
+
+        print(f"START: {job_id} -> {output}")
 
         try:
             proc = subprocess.Popen(
@@ -213,73 +247,28 @@ def worker(job_queue: queue.Queue, state: ActiveState, completed_set: set, compl
             with completed_lock:
                 append_completed(completed_file, rec)
                 completed_set.add(job_id)
-            print(f"\nDONE: {job_id} -> {output}")
+            print(f"DONE: {job_id} -> {output}")
             state.finish_job(job_id, duration, ok=True)
         else:
-            print(f"\nERROR: {job_id} failed with exit code {rc}", file=sys.stderr)
+            print(f"ERROR: {job_id} failed with exit code {rc}", file=sys.stderr)
             state.finish_job(job_id, duration, ok=False)
 
         job_queue.task_done()
 
 
-def print_progress_loop(state: ActiveState, stop_event: threading.Event):
-    while not stop_event.is_set():
-        snap = state.snapshot()
-        active = snap["active"]
-
-        active_sum = sum(min(v["progress_seconds"], v["duration"]) for v in active.values())
-        done = snap["completed_duration"] + active_sum
-        total = snap["total_duration"]
-        pct = (done / total * 100.0) if total > 0 else 0.0
-
-        elapsed = time.time() - snap["started"]
-        eta = 0.0
-        if done > 0:
-            est_total = elapsed * (total / done)
-            eta = max(0.0, est_total - elapsed)
-
-        lines = []
-        lines.append(
-            f"Overall: {pct:6.2f}% | outputs {snap['done_count']}/{snap['total_count']} | "
-            f"elapsed {fmt_hms(elapsed)} | ETA {fmt_hms(eta)}"
-        )
-
-        for job_id in sorted(active.keys()):
-            j = active[job_id]
-            prog = min(j["progress_seconds"], j["duration"])
-            jpct = (prog / j["duration"] * 100.0) if j["duration"] > 0 else 0.0
-
-            jeta = 0.0
-            if prog > 0:
-                jelapsed = time.time() - j["started"]
-                jtotal_est = jelapsed * (j["duration"] / prog)
-                jeta = max(0.0, jtotal_est - jelapsed)
-
-            lines.append(
-                f"  {Path(j['source']).name} [{j['variant']}] | {jpct:6.2f}% | "
-                f"{fmt_hms(prog)}/{fmt_hms(j['duration'])} | "
-                f"ETA {fmt_hms(jeta)} | speed {j['speed'] or '?'}"
-            )
-
-        sys.stdout.write("\x1b[2J\x1b[H")
-        sys.stdout.write("\n".join(lines) + "\n")
-        sys.stdout.flush()
-
-        stop_event.wait(1.0)
+def status_loop(state: ActiveState, stop_event: threading.Event, interval: int):
+    while not stop_event.wait(interval):
+        print_status(state)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Run ffmpeg transcode jobs from a JSONL jobs file.\n\n"
-            "Completion is defined as:\n"
-            "  - ffmpeg exit code 0\n"
-            "  - output file exists\n"
-            "  - output file size > 0\n\n"
-            "On restart:\n"
-            "  - fully completed jobs are skipped\n"
-            "  - partial or missing outputs are re-run\n"
-            "  - ffmpeg uses -y, so partial outputs are overwritten\n"
+            "Logging is simple:\n"
+            "  - immediate START/DONE/ERROR lines\n"
+            "  - status summary printed every N seconds\n"
+            "  - no console clearing"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -313,6 +302,12 @@ def parse_args():
         action="store_true",
         help="Sort pending jobs by descending duration before execution.",
     )
+    parser.add_argument(
+        "--status-interval",
+        type=int,
+        default=10,
+        help="Seconds between status updates. Default: %(default)s",
+    )
 
     return parser.parse_args()
 
@@ -322,6 +317,10 @@ def main():
 
     if args.concurrency < 1:
         print("ERROR: --concurrency must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.status_interval < 1:
+        print("ERROR: --status-interval must be >= 1", file=sys.stderr)
         sys.exit(1)
 
     if not args.jobs_file.exists():
@@ -356,6 +355,10 @@ def main():
     state = ActiveState()
     state.set_totals(pending_jobs)
 
+    print(f"Starting {len(pending_jobs)} job(s) with concurrency={args.concurrency}")
+    print(f"Status updates every {args.status_interval} seconds")
+    print_status(state)
+
     job_queue = queue.Queue()
     workers = []
 
@@ -375,23 +378,25 @@ def main():
         job_queue.put(None)
 
     stop_event = threading.Event()
-    progress_thread = threading.Thread(target=print_progress_loop, args=(state, stop_event), daemon=True)
-    progress_thread.start()
+    status_thread = threading.Thread(
+        target=status_loop,
+        args=(state, stop_event, args.status_interval),
+        daemon=True,
+    )
+    status_thread.start()
 
     try:
         job_queue.join()
     except KeyboardInterrupt:
-        print(
-            "\nInterrupted. Running ffmpeg processes may continue until the OS terminates them.",
-            file=sys.stderr,
-        )
+        print("\nInterrupted.", file=sys.stderr)
         stop_event.set()
-        progress_thread.join(timeout=2)
+        status_thread.join(timeout=2)
         sys.exit(130)
 
     stop_event.set()
-    progress_thread.join(timeout=2)
+    status_thread.join(timeout=2)
 
+    print_status(state)
     snap = state.snapshot()
     print(f"Finished. Outputs done: {snap['done_count']}/{snap['total_count']}")
 

@@ -97,19 +97,3 @@ Then use:
 docker compose run --rm transcode plan --help
 docker compose run --rm transcode run --help
 ```
-
----
-
-# 6) About the orphan warning
-
-This is harmless, but if you want to clean it up:
-
-```bash
-docker compose run --rm --remove-orphans transcode plan --help
-```
-
-or:
-
-```bash
-docker compose down --remove-orphans
-```
