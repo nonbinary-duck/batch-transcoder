@@ -62,9 +62,6 @@ def fmt_hms(total_seconds: float) -> str:
 
 
 def has_dv(v: dict) -> bool:
-    # Your sample has:
-    # side_data_type: "DOVI configuration record"
-    # dv_profile + rpu_present_flag etc.
     side_data = v.get("side_data_list", []) or []
     for sd in side_data:
         side_type = str(sd.get("side_data_type", "")).lower()
@@ -142,18 +139,16 @@ def resolve_output_path(
     if output_root is None:
         return src.parent / filename
 
-    # Safety: only preserve structure if src is under source_root
     try:
         rel_parent = src.parent.relative_to(source_root)
     except ValueError:
-        # Shouldn't happen because we rglob under source_root, but be defensive.
         rel_parent = Path()
 
     return output_root / rel_parent / filename
 
 
 def build_filter(*, is_dv: bool, make_1080: bool, tonemap_to_sdr: bool, npl: int, tonemap_operator: str) -> str:
-    # Tonemap to SDR: use npl configurable (default 83)
+    # Tonemap to SDR: use npl configurable
     if tonemap_to_sdr:
         chain = [
             f"zscale=t=linear:npl={npl}",
@@ -167,8 +162,16 @@ def build_filter(*, is_dv: bool, make_1080: bool, tonemap_to_sdr: bool, npl: int
             chain.append("scale=1920:1080:flags=lanczos")
         return ",".join(chain)
 
-    # HDR/DV (not tonemapping): keep your existing behaviour but npl=83 (configurable)
+    # Dolby Vision: strictly pass-through (no tone-mapping/zscale), but enforce 12-bit
     if is_dv:
+        chain = []
+        if make_1080:
+            chain.append("scale=1920:1080:flags=lanczos")
+        chain.append("format=yuv420p12le")
+        return ",".join(chain)
+
+    # Standard HDR10 (not DV, not tonemapping)
+    if not tonemap_to_sdr:  
         chain = [
             f"zscale=t=linear:npl={npl}",
             "format=gbrpf32le",
@@ -187,9 +190,21 @@ def build_filter(*, is_dv: bool, make_1080: bool, tonemap_to_sdr: bool, npl: int
     return "format=yuv420p10le"
 
 
-def build_x265_params(*, enable_hdr_signalling: bool, vbv_maxrate: int | None, vbv_bufsize: int | None) -> str:
+def build_x265_params(
+    *, 
+    enable_hdr_signalling: bool, 
+    enable_dolbyvision: bool, 
+    vbv_maxrate: int | None, 
+    vbv_bufsize: int | None
+) -> str:
     params = ["repeat-headers=1"]
-    if enable_hdr_signalling:
+    
+    if enable_dolbyvision:
+        params.extend([
+            "hdr-opt=1",
+            "dolby-vision-profile=8.1"
+        ])
+    elif enable_hdr_signalling:
         params.extend([
             "hdr-opt=1",
             "colorprim=bt2020",
@@ -197,7 +212,7 @@ def build_x265_params(*, enable_hdr_signalling: bool, vbv_maxrate: int | None, v
             "colormatrix=bt2020nc",
             "range=limited",
         ])
-    # DV guidance: include VBV constraints when doing DV RPU coding (user asked; make configurable)
+        
     if vbv_maxrate is not None:
         params.append(f"vbv-maxrate={int(vbv_maxrate)}")
     if vbv_bufsize is not None:
@@ -232,14 +247,17 @@ def build_ffmpeg_command(
         tonemap_operator=tonemap_operator,
     )
 
-    # If tonemapping to SDR, do NOT signal HDR in x265 params.
-    enable_hdr_signalling = (not tonemap_to_sdr) and (is_hdr_src or is_dv)
-
-    # Only apply DV features when actually DV and not tonemapping.
+    # Standard HDR signalling (only if HDR, NOT tonemapping, and NOT DV)
+    enable_hdr_signalling = (not tonemap_to_sdr) and is_hdr_src and (not is_dv)
+    # DV Signalling (only if DV and NOT tonemapping)
     enable_dolbyvision = is_dv and (not tonemap_to_sdr)
 
     vbv_maxrate = dv_vbv_maxrate if enable_dolbyvision else None
     vbv_bufsize = dv_vbv_bufsize if enable_dolbyvision else None
+
+    # Determine 10-bit vs 12-bit output requirements
+    pix_fmt = "yuv420p12le" if enable_dolbyvision else "yuv420p10le"
+    profile = "main12" if enable_dolbyvision else "main10"
 
     cmd = [
         "ffmpeg",
@@ -256,17 +274,14 @@ def build_ffmpeg_command(
         "-c:v", "libx265",
         "-preset", preset,
         "-crf", str(crf),
-        "-pix_fmt", "yuv420p10le",
-        "-profile:v", "main10",
+        "-pix_fmt", pix_fmt,
+        "-profile:v", profile,
     ]
-
-    if enable_dolbyvision:
-        # FFmpeg 8.0.1 + libx265 supports this in your container.
-        cmd += ["-dolbyvision", "1"]
 
     cmd += [
         "-x265-params", build_x265_params(
             enable_hdr_signalling=enable_hdr_signalling,
+            enable_dolbyvision=enable_dolbyvision,
             vbv_maxrate=vbv_maxrate,
             vbv_bufsize=vbv_bufsize,
         ),
@@ -320,7 +335,6 @@ def parse_args():
     parser.add_argument("--crf", type=int, default=18, help="libx265 CRF value. Default: %(default)s")
     parser.add_argument("--preset", default="medium", help="libx265 preset. Default: %(default)s")
 
-    # HDR/SDR selection toggles (only affect HDR/DV sources)
     g_hdr = parser.add_mutually_exclusive_group()
     g_hdr.add_argument(
         "--only-hdr-from-hdr",
@@ -333,7 +347,6 @@ def parse_args():
         help="For HDR/DV sources, output only SDR-tonemapped. SDR sources still encoded as SDR.",
     )
 
-    # Resolution selection toggles (only affect >=2160 sources)
     g_res = parser.add_mutually_exclusive_group()
     g_res.add_argument(
         "--only-native",
@@ -346,7 +359,6 @@ def parse_args():
         help="For sources >=2160, output only the 1080 variant (no native). For <2160, keep native.",
     )
 
-    # Tonemap / DV knobs
     parser.add_argument(
         "--npl",
         type=int,
@@ -358,13 +370,13 @@ def parse_args():
         "--dv-vbv-maxrate",
         type=int,
         default=40000,
-        help="Dolby Vision (libx265 -dolbyvision 1) vbv-maxrate value. Default: %(default)s",
+        help="Dolby Vision (libx265 dolby-vision-profile) vbv-maxrate value. Default: %(default)s",
     )
     parser.add_argument(
         "--dv-vbv-bufsize",
         type=int,
         default=40000,
-        help="Dolby Vision (libx265 -dolbyvision 1) vbv-bufsize value. Default: %(default)s",
+        help="Dolby Vision (libx265 dolby-vision-profile) vbv-bufsize value. Default: %(default)s",
     )
 
     parser.add_argument(
@@ -426,10 +438,6 @@ def main():
         is_2160_or_more = (width >= 3840 or height >= 2160)
         would_make_1080 = is_2160_or_more and (not args.only_native)
 
-        # Apply resolution selector:
-        # - default for >=2160: native + 1080
-        # - --only-native: native only
-        # - --only-1080-from-2160: 1080 only (but only when >=2160)
         make_native_variant = True
         make_1080_variant = would_make_1080
 
@@ -437,8 +445,6 @@ def main():
             make_native_variant = False
             make_1080_variant = True
 
-        # Decide which "colour outputs" to make for HDR sources
-        # Defaults for HDR sources: both HDR and SDR-tonemapped
         want_hdr_output = hdr_src
         want_sdr_tonemap_output = hdr_src
 
@@ -448,10 +454,6 @@ def main():
             if args.only_sdr_from_hdr:
                 want_hdr_output = False
 
-        # Suffix rules:
-        # - DV HDR outputs: ".dv-hdr"
-        # - HDR10 outputs: ".hdr"
-        # - SDR outputs: no suffix
         def hdr_suffix_for_stream() -> str | None:
             if not hdr_src:
                 return None
@@ -460,7 +462,6 @@ def main():
             return "hdr"
 
         outputs_to_make: list[tuple[str, bool, str | None]] = []
-        # tuple: (label, tonemap_to_sdr, suffix)
 
         if hdr_src:
             if want_hdr_output:
