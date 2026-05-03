@@ -79,12 +79,26 @@ class ActiveState:
         self.total_count = len(jobs)
 
     def start_job(self, job):
+        is_dv = job.get("is_dv", False)
+        is_hdr = job.get("is_hdr", False)
+        tonemapped = job.get("tonemapped", False)
+        
+        if is_dv:
+            fmt_str = "DV HDR"
+        elif is_hdr:
+            fmt_str = "HDR10"
+        elif tonemapped:
+            fmt_str = "SDR (Tonemapped)"
+        else:
+            fmt_str = "SDR"
+
         with self.lock:
             self.active[job["job_id"]] = {
                 "job_id": job["job_id"],
                 "source": job["source"],
                 "output": job["output"],
                 "variant": job["variant"],
+                "display_format": fmt_str,
                 "duration": float(job.get("duration_seconds", 0.0) or 0.0),
                 "progress_seconds": 0.0,
                 "speed": "",
@@ -143,8 +157,11 @@ def print_status(state: ActiveState):
         j = active[job_id]
         prog = min(j["progress_seconds"], j["duration"])
         jpct = (prog / j["duration"] * 100.0) if j["duration"] > 0 else 0.0
+        
+        variant_label = "1080p" if j['variant'] == "1080" else j['variant']
+        
         print(
-            f"  RUNNING | {Path(j['source']).name} [{j['variant']}] "
+            f"  RUNNING | {Path(j['source']).name} [{variant_label} {j['display_format']}] "
             f"{jpct:6.2f}% {fmt_hms(prog)}/{fmt_hms(j['duration'])} "
             f"speed {j['speed'] or '?'}"
         )
