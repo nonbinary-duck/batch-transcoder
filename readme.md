@@ -1,17 +1,13 @@
-# Batch Transcoder (planner/runner)
+# Batch Transcoder (Planner & Runner)
 
-Dockerised FFmpeg workflow:
+A Dockerised FFmpeg workflow for bulk processing video files with correct HDR, Dolby Vision, and SDR handling.
 
-- `plan` scans a media tree and writes:
-  - `transcode_jobs.jsonl` (source of truth for execution)
-  - `transcode_manifest.csv` (human-readable)
-  - `ffmpeg_commands.txt` (one command per line)
-- `run` executes `transcode_jobs.jsonl` with configurable concurrency and resumable state in `completed_jobs.jsonl`.
-
-## Project layout
-
-- `scripts/` contains the planner, runner and container entrypoint.
-- `work/` is a local scratch directory mounted into the container at `/work`.
+The system uses a two-phase architecture:
+- `plan` scans a media tree and generates structured task files.
+  - `transcode_jobs.jsonl` (source of truth for the runner)
+  - `transcode_manifest.csv` (human-readable spreadsheet of jobs)
+  - `ffmpeg_commands.txt` (a plain-text list of commands)
+- `run` executes the jobs in `transcode_jobs.jsonl` with configurable concurrency, maintaining state in `completed_jobs.jsonl` to allow seamless resuming.
 
 ## Build
 
@@ -19,67 +15,67 @@ Dockerised FFmpeg workflow:
 docker compose build
 ```
 
-## Run as your user (avoid root-owned outputs)
-<<<<<<< HEAD
-=======
-> [!WARNING]
-> This will fail (during the planner) with the error `PermissionError: [Errno 13] Permission denied: 'ffmpeg_commands.txt'`
-> If I fix it, I will remove this warning. Feel free to make a 5-min PR.
->>>>>>> 0c98fcd (Fix markdown syntax)
+## Phase 1: Plan Jobs
 
-When you bind-mount host directories into a container, files created in the mount will be owned by the container user. To avoid root-owned files on your host, run the container with your current UID:GID.
+The planner analyses the media and decides what FFmpeg commands need to be executed. 
 
-### Linux/macOS (Docker Engine)
+**Default Behaviour:**
+- **HDR / Dolby Vision sources:** Plans one `native` resolution HDR output AND one `1080p` SDR tonemapped output.
+- **SDR sources:** Plans one `native` resolution SDR output.
 
-Use `--user "$(id -u):$(id -g)"` in commands below.
-
-> Note: On some macOS setups, ownership mapping behaves differently, but using `--user` is still a safe default.
-
-## Plan
-
-Plan outputs next to sources (inside the mounted path):
+To plan outputs next to your source files:
 
 ```bash
 docker compose run --rm \
-  --user "$(id -u):$(id -g)" \
   -v /path/to/media:/media \
   transcode \
   plan /media
 ```
 
-Plan with a separate output root:
+To plan outputs to a completely separate directory (retaining folder structure):
 
 ```bash
 docker compose run --rm \
-  --user "$(id -u):$(id -g)" \
   -v /path/to/media:/media \
   -v /path/to/encoded:/encoded \
   transcode \
   plan /media --output-root /encoded
 ```
 
-HDR behaviour:
-- Default: HDR/Dolby Vision sources are planned as SDR tonemapped outputs.
-- `--preserve-hdr`: keep HDR outputs instead.
-- `--add-sdr`: output both HDR and SDR (implies `--preserve-hdr`).
+### Overriding Planned Resolutions
+You can explicitly define which resolutions are created using the planner flags (`none`, `native`, `1080`, `both`).
 
-## Run
+```bash
+# Example: Only produce native HDR (no SDR tonemapping) from HDR sources,
+# and produce both native and 1080p outputs for SDR sources.
+docker compose run --rm \
+  -v /path/to/media:/media \
+  transcode plan /media \
+  --hdr-out native \
+  --sdr-tonemap-out none \
+  --sdr-out both
+```
+
+## Phase 2: Run Executions
+
+Once the `transcode_jobs.jsonl` file is written, you can begin the encoding process.
 
 ```bash
 docker compose run --rm \
-  --user "$(id -u):$(id -g)" \
   -v /path/to/media:/media \
   -v /path/to/encoded:/encoded \
   transcode \
   run --concurrency 2
 ```
 
-## Resume behaviour
+*(Note: the `/encoded` volume mount is only required during execution if you passed `--output-root` during the planning phase).*
 
-A job is considered complete only if:
-- ffmpeg exits with code `0`
-- output exists and has non-zero size
+### Resume Behaviour
 
-On restart:
-- completed jobs are skipped
-- partial jobs are re-run (outputs overwritten)
+The runner is fully stateless apart from `completed_jobs.jsonl`. A job is considered complete only if:
+1. `ffmpeg` exits with code `0`.
+2. The output file exists and has a non-zero size.
+
+If you cancel the run (`Ctrl+C`) or a container restarts:
+- Completely encoded jobs are immediately skipped.
+- Partially encoded jobs are overwritten and restarted from scratch.
