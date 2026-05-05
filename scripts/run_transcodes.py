@@ -221,6 +221,13 @@ def worker(job_queue: queue.Queue, state: ActiveState, completed_set: set, compl
 
         print(f"START: {job_id} -> {output}")
 
+        src_path = Path(job["source"])
+        if not src_path.exists() or not src_path.is_file():
+            print(f"ERROR: input missing, skipping without touching output: {src_path}", file=sys.stderr)
+            state.finish_job(job_id, duration, ok=False)
+            job_queue.task_done()
+            continue
+
         try:
             proc = subprocess.Popen(
                 cmd,
